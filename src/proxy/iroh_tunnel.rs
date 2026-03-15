@@ -10,7 +10,7 @@
 //! HTTP server. The peer sends HTTP/1.1 requests and receives HTTP responses,
 //! exactly as if connected via TCP. No additional framing or handshake.
 //!
-//! ALPN: `clankers-router-http/1`
+//! ALPN: `clanker-router-http/1`
 //!
 //! # Architecture
 //!
@@ -20,7 +20,7 @@
 //! are under our control.
 //!
 //! ```text
-//! Remote clankers client
+//! Remote client
 //!   │ iroh QUIC (bidirectional stream)
 //!   ▼
 //! IrohTunnel (ProtocolHandler)
@@ -46,8 +46,8 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
-/// ALPN for clankers-router HTTP tunnel over iroh.
-pub const ALPN: &[u8] = b"clankers-router-http/1";
+/// ALPN for clanker-router HTTP tunnel over iroh.
+pub const ALPN: &[u8] = b"clanker-router-http/1";
 
 /// Metrics for the iroh tunnel.
 #[derive(Debug, Default)]

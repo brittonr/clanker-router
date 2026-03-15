@@ -20,7 +20,7 @@ pub struct DaemonInfo {
 
 /// Default path for daemon.json.
 pub fn daemon_info_path() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("clankers-router").join("daemon.json")
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("clanker-router").join("daemon.json")
 }
 
 impl DaemonInfo {
@@ -63,7 +63,7 @@ fn pid_alive(_pid: u32) -> bool {
     true
 }
 
-/// Try to find and start the `clankers-router` binary as a background daemon.
+/// Try to find and start the `clanker-router` binary as a background daemon.
 ///
 /// Returns the path to daemon.json if the daemon was started (or was already running).
 pub fn auto_start_daemon() -> Option<PathBuf> {
@@ -78,7 +78,7 @@ pub fn auto_start_daemon() -> Option<PathBuf> {
         DaemonInfo::remove(&info_path);
     }
 
-    // Find the clankers-router binary
+    // Find the clanker-router binary
     let bin = std::env::var("CLANKERS_ROUTER_BIN").ok().or_else(find_in_path)?;
 
     tracing::info!("Auto-starting router daemon: {}", bin);
@@ -128,11 +128,11 @@ pub fn auto_start_daemon() -> Option<PathBuf> {
     }
 }
 
-/// Find `clankers-router` in PATH.
+/// Find `clanker-router` in PATH.
 fn find_in_path() -> Option<String> {
     let path_var = std::env::var("PATH").ok()?;
     for dir in path_var.split(':') {
-        let candidate = Path::new(dir).join("clankers-router");
+        let candidate = Path::new(dir).join("clanker-router");
         if candidate.is_file() {
             return Some(candidate.to_string_lossy().to_string());
         }

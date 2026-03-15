@@ -11,8 +11,8 @@
 //! # Usage
 //!
 //! ```ignore
-//! use clankers_router::backends::huggingface::*;
-//! use clankers_router::backends::openai_compat::*;
+//! use clanker_router::backends::huggingface::*;
+//! use clanker_router::backends::openai_compat::*;
 //!
 //! // Cloud inference
 //! let provider = OpenAICompatProvider::new(OpenAICompatConfig::huggingface("hf_...".into()));
@@ -58,7 +58,7 @@ impl OpenAICompatConfig {
 /// Default set of popular models available on HuggingFace Serverless Inference.
 ///
 /// These are models that are commonly available without a dedicated endpoint.
-/// The user can discover more via `clankers-router hf search`.
+/// The user can discover more via `clanker-router hf search`.
 fn default_hf_models() -> Vec<Model> {
     vec![
         Model {
@@ -708,9 +708,9 @@ impl PulledModel {
 
 /// Default cache directory for downloaded models.
 ///
-/// Uses `$XDG_CACHE_HOME/clankers-router/models` or `~/.cache/clankers-router/models`.
+/// Uses `$XDG_CACHE_HOME/clanker-router/models` or `~/.cache/clanker-router/models`.
 fn default_cache_dir() -> PathBuf {
-    dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache")).join("clankers-router").join("models")
+    dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache")).join("clanker-router").join("models")
 }
 
 /// Parse quantization level from a GGUF filename.

@@ -1,4 +1,4 @@
-//! clankers-router CLI + TUI
+//! clanker-router CLI + TUI
 //!
 //! Standalone binary for managing LLM provider routing, credentials,
 //! model discovery, and interactive chat.
@@ -8,22 +8,22 @@ mod tui;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clankers_router::Router;
-use clankers_router::auth::AuthStore;
-use clankers_router::auth::StoredCredential;
-use clankers_router::auth::env_var_for_provider;
-use clankers_router::auth::resolve_credential;
-use clankers_router::backends::huggingface::HubClient;
-use clankers_router::backends::openai_compat::OpenAICompatConfig;
-use clankers_router::backends::openai_compat::OpenAICompatProvider;
-use clankers_router::credential_pool::CredentialPool;
-use clankers_router::credential_pool::SelectionStrategy;
-use clankers_router::model::ModelAliases;
-use clankers_router::oauth;
-use clankers_router::provider::CompletionRequest;
-use clankers_router::provider::Provider;
-use clankers_router::streaming::ContentDelta;
-use clankers_router::streaming::StreamEvent;
+use clanker_router::Router;
+use clanker_router::auth::AuthStore;
+use clanker_router::auth::StoredCredential;
+use clanker_router::auth::env_var_for_provider;
+use clanker_router::auth::resolve_credential;
+use clanker_router::backends::huggingface::HubClient;
+use clanker_router::backends::openai_compat::OpenAICompatConfig;
+use clanker_router::backends::openai_compat::OpenAICompatProvider;
+use clanker_router::credential_pool::CredentialPool;
+use clanker_router::credential_pool::SelectionStrategy;
+use clanker_router::model::ModelAliases;
+use clanker_router::oauth;
+use clanker_router::provider::CompletionRequest;
+use clanker_router::provider::Provider;
+use clanker_router::streaming::ContentDelta;
+use clanker_router::streaming::StreamEvent;
 use clap::Parser;
 use clap::Subcommand;
 use clap::ValueEnum;
@@ -33,7 +33,7 @@ use tokio::sync::mpsc;
 
 #[derive(Parser)]
 #[command(
-    name = "clankers-router",
+    name = "clanker-router",
     about = "LLM provider router — route, chat, and manage credentials",
     version
 )]
@@ -258,7 +258,7 @@ enum OutputFormat {
 // ── Paths ───────────────────────────────────────────────────────────────
 
 fn default_auth_path() -> PathBuf {
-    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("clankers-router").join("auth.json")
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("clanker-router").join("auth.json")
 }
 
 fn resolve_auth_path(cli: &Cli) -> PathBuf {
@@ -329,8 +329,8 @@ fn build_providers(cli: &Cli, auth_store: &AuthStore) -> Vec<Arc<dyn Provider>> 
     {
         let creds = all_creds_for("anthropic");
         if !creds.is_empty() {
-            use clankers_router::backends::anthropic::AnthropicProvider;
-            use clankers_router::backends::anthropic::Credential;
+            use clanker_router::backends::anthropic::AnthropicProvider;
+            use clanker_router::backends::anthropic::Credential;
             let base_url = if cli.provider.as_deref() == Some("anthropic") {
                 cli.api_base.clone()
             } else {
@@ -430,7 +430,7 @@ fn build_providers(cli: &Cli, auth_store: &AuthStore) -> Vec<Arc<dyn Provider>> 
 
     if cli.provider.as_deref() == Some("local") {
         let base = cli.api_base.clone().unwrap_or_else(|| "http://localhost:11434/v1".into());
-        let models = vec![clankers_router::Model {
+        let models = vec![clanker_router::Model {
             id: cli.model.clone(),
             name: cli.model.clone(),
             provider: "local".into(),
@@ -449,12 +449,12 @@ fn build_providers(cli: &Cli, auth_store: &AuthStore) -> Vec<Arc<dyn Provider>> 
 }
 
 fn default_db_path() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("clankers-router").join("router.db")
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("clanker-router").join("router.db")
 }
 
 fn build_router(cli: &Cli, auth_store: &AuthStore) -> Router {
     let db_path = default_db_path();
-    let mut router = match clankers_router::RouterDb::open(&db_path) {
+    let mut router = match clanker_router::RouterDb::open(&db_path) {
         Ok(db) => {
             tracing::debug!("Opened router database at {}", db_path.display());
             Router::with_db(&cli.model, db)
@@ -470,7 +470,7 @@ fn build_router(cli: &Cli, auth_store: &AuthStore) -> Router {
 
     // Enable default fallback chains so rate-limited providers
     // automatically fall over to alternatives.
-    router.set_fallbacks(clankers_router::FallbackConfig::with_defaults());
+    router.set_fallbacks(clanker_router::FallbackConfig::with_defaults());
 
     router
 }
@@ -487,12 +487,12 @@ async fn main() {
         iroh_relay=error,iroh_tickets=error,netwatch=error,portmapper=error,swarm_discovery=error";
     if cli.verbose {
         tracing_subscriber::fmt()
-            .with_env_filter(format!("clankers_router=debug{iroh_filters}"))
+            .with_env_filter(format!("clanker_router=debug{iroh_filters}"))
             .with_writer(std::io::stderr)
             .init();
     } else {
         tracing_subscriber::fmt()
-            .with_env_filter(format!("clankers_router=warn{iroh_filters}"))
+            .with_env_filter(format!("clanker_router=warn{iroh_filters}"))
             .with_writer(std::io::stderr)
             .init();
     }
@@ -560,7 +560,7 @@ async fn run_ask(
 
     if router.provider_names().is_empty() {
         eprintln!("Error: No providers configured. Set an API key:");
-        eprintln!("  clankers-router auth set-key openai sk-...");
+        eprintln!("  clanker-router auth set-key openai sk-...");
         eprintln!("  export OPENAI_API_KEY=sk-...");
         std::process::exit(1);
     }
@@ -583,7 +583,7 @@ async fn run_ask(
     let complete_handle = tokio::spawn(async move { router.complete(request, tx).await });
 
     let mut full_text = String::new();
-    let mut usage = clankers_router::provider::Usage::default();
+    let mut usage = clanker_router::provider::Usage::default();
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -650,7 +650,7 @@ fn run_models(cli: &Cli, auth_store: &AuthStore, provider_filter: Option<&str>, 
 
     if models.is_empty() {
         eprintln!("No models available. Configure a provider first:");
-        eprintln!("  clankers-router auth set-key openai sk-...");
+        eprintln!("  clanker-router auth set-key openai sk-...");
         return;
     }
 
@@ -850,7 +850,7 @@ async fn run_auth_login(auth_path: &PathBuf, account: &str, code_input: Option<&
     let verifier = match std::fs::read_to_string(&verifier_path) {
         Ok(v) => v,
         Err(_) => {
-            eprintln!("Error: No login in progress. Run `clankers-router auth login` first.");
+            eprintln!("Error: No login in progress. Run `clanker-router auth login` first.");
             std::process::exit(1);
         }
     };
@@ -942,7 +942,7 @@ fn run_resolve(cli: &Cli, auth_store: &AuthStore, name: &str) {
         }
     } else {
         eprintln!("Model not found: {}", name);
-        eprintln!("Hint: configure a provider first, or check `clankers-router models`");
+        eprintln!("Hint: configure a provider first, or check `clanker-router models`");
         std::process::exit(1);
     }
 }
@@ -952,14 +952,14 @@ fn run_resolve(cli: &Cli, auth_store: &AuthStore, name: &str) {
 fn run_status(cli: &Cli, auth_store: &AuthStore) {
     let router = build_router(cli, auth_store);
 
-    println!("clankers-router v{}", env!("CARGO_PKG_VERSION"));
+    println!("clanker-router v{}", env!("CARGO_PKG_VERSION"));
     println!();
 
     let providers = router.provider_names();
     if providers.is_empty() {
         println!("Providers: none configured");
         println!("\nSet up a provider:");
-        println!("  clankers-router auth set-key openai sk-...");
+        println!("  clanker-router auth set-key openai sk-...");
         println!("  export OPENAI_API_KEY=sk-...");
         return;
     }
@@ -978,7 +978,7 @@ fn run_status(cli: &Cli, auth_store: &AuthStore) {
 
 fn run_usage(days: usize, total_only: bool, json: bool) {
     let db_path = default_db_path();
-    let db = match clankers_router::RouterDb::open(&db_path) {
+    let db = match clanker_router::RouterDb::open(&db_path) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("Failed to open database: {}", e);
@@ -1071,7 +1071,7 @@ fn run_usage(days: usize, total_only: bool, json: bool) {
     }
 }
 
-fn print_usage_summary(label: &str, usage: &clankers_router::db::usage::DailyUsage) {
+fn print_usage_summary(label: &str, usage: &clanker_router::db::usage::DailyUsage) {
     println!("{} Usage:", label);
     println!("  Requests:      {}", usage.requests);
     println!("  Input tokens:  {}K", usage.input_tokens / 1000);
@@ -1097,16 +1097,16 @@ fn print_usage_summary(label: &str, usage: &clankers_router::db::usage::DailyUsa
 // ── Serve (RPC daemon) ──────────────────────────────────────────────────
 
 async fn run_serve(cli: &Cli, auth_store: &AuthStore, daemon: bool, proxy_addr: &str, proxy_keys: &[String]) {
-    use clankers_router::proxy::ProxyConfig;
-    use clankers_router::proxy::iroh_tunnel::IrohTunnel;
-    use clankers_router::proxy::iroh_tunnel::{self};
-    use clankers_router::proxy::{self};
-    use clankers_router::rpc::daemon::DaemonInfo;
+    use clanker_router::proxy::ProxyConfig;
+    use clanker_router::proxy::iroh_tunnel::IrohTunnel;
+    use clanker_router::proxy::iroh_tunnel::{self};
+    use clanker_router::proxy::{self};
+    use clanker_router::rpc::daemon::DaemonInfo;
 
     // --daemon: re-exec ourselves as a detached background process,
     // then exit the parent immediately so the shell gets its prompt back.
     if daemon {
-        let info_path = clankers_router::rpc::daemon::daemon_info_path();
+        let info_path = clanker_router::rpc::daemon::daemon_info_path();
 
         // Bail if a daemon is already running
         if let Some(info) = DaemonInfo::load(&info_path) {
@@ -1168,7 +1168,7 @@ async fn run_serve(cli: &Cli, auth_store: &AuthStore, daemon: bool, proxy_addr: 
     if router.provider_names().is_empty() {
         eprintln!("Error: No providers configured.");
         eprintln!("Set an API key first:");
-        eprintln!("  clankers-router auth set-key openai sk-...");
+        eprintln!("  clanker-router auth set-key openai sk-...");
         eprintln!("  export OPENAI_API_KEY=sk-...");
         std::process::exit(1);
     }
@@ -1194,13 +1194,13 @@ async fn run_serve(cli: &Cli, auth_store: &AuthStore, daemon: bool, proxy_addr: 
     };
 
     // Build the iroh endpoint with both:
-    //   1. The existing RPC protocol (for clankers ↔ router communication)
+    //   1. The existing RPC protocol (for client ↔ router communication)
     //   2. The HTTP tunnel protocol (for remote OpenAI-compatible access)
     let secret_key = iroh::SecretKey::generate(&mut rand::rng());
-    let iroh_rpc_alpn = clankers_router::rpc::ALPN.to_vec();
+    let iroh_rpc_alpn = clanker_router::rpc::ALPN.to_vec();
     let iroh_tunnel_alpn = iroh_tunnel::ALPN.to_vec();
 
-    let mdns = iroh::address_lookup::MdnsAddressLookup::builder().service_name(clankers_router::rpc::MDNS_SERVICE);
+    let mdns = iroh::address_lookup::MdnsAddressLookup::builder().service_name(clanker_router::rpc::MDNS_SERVICE);
 
     let endpoint = match iroh::Endpoint::builder()
         .secret_key(secret_key.clone())
@@ -1231,7 +1231,7 @@ async fn run_serve(cli: &Cli, auth_store: &AuthStore, daemon: bool, proxy_addr: 
     let tunnel = IrohTunnel::new(bind_addr);
 
     // Create the RPC handler (shares the same Arc<Router> with the proxy)
-    let rpc_handler = clankers_router::rpc::server::RpcHandler::new(Arc::clone(&router));
+    let rpc_handler = clanker_router::rpc::server::RpcHandler::new(Arc::clone(&router));
 
     // Build the iroh protocol router with both handlers
     let iroh_router = iroh::protocol::Router::builder(endpoint.clone())
@@ -1240,7 +1240,7 @@ async fn run_serve(cli: &Cli, auth_store: &AuthStore, daemon: bool, proxy_addr: 
         .spawn();
 
     let node_id = endpoint.id().to_string();
-    let info_path = clankers_router::rpc::daemon::daemon_info_path();
+    let info_path = clanker_router::rpc::daemon::daemon_info_path();
 
     // Collect bound addresses
     let addrs: Vec<String> = endpoint
@@ -1394,7 +1394,7 @@ async fn run_hf(cli: &Cli, auth_store: &AuthStore, action: &HfAction) {
                 }
                 let gguf_count = info.siblings.iter().filter(|s| s.filename.ends_with(".gguf")).count();
                 if gguf_count > 0 {
-                    println!("GGUF files: {} (run `clankers-router hf files {}` to list)", gguf_count, model);
+                    println!("GGUF files: {} (run `clanker-router hf files {}` to list)", gguf_count, model);
                 }
             }
             Err(e) => {
@@ -1423,7 +1423,7 @@ async fn run_hf(cli: &Cli, auth_store: &AuthStore, action: &HfAction) {
                     );
                 }
                 println!("\n{} GGUF file(s)", files.len());
-                println!("\nPull with: clankers-router hf pull {} --quant Q4_K_M", model);
+                println!("\nPull with: clanker-router hf pull {} --quant Q4_K_M", model);
             }
             Err(e) => {
                 eprintln!("Failed to list files: {}", e);
@@ -1461,19 +1461,19 @@ async fn run_hf(cli: &Cli, auth_store: &AuthStore, action: &HfAction) {
                             Ok(name) => {
                                 println!("\nRegistered with Ollama as: {}", name);
                                 println!("Run with:  ollama run {}", name);
-                                println!("Or route:  clankers-router --provider local --model {} ask \"hello\"", name);
+                                println!("Or route:  clanker-router --provider local --model {} ask \"hello\"", name);
                             }
                             Err(e) => {
                                 eprintln!("\nFailed to register with Ollama: {}", e);
                                 eprintln!("You can register manually later:");
-                                eprintln!("  clankers-router hf ollama {}", model);
+                                eprintln!("  clanker-router hf ollama {}", model);
                             }
                         }
                     } else {
                         println!("\nTo serve with Ollama:");
-                        println!("  clankers-router hf pull {} --ollama", model);
+                        println!("  clanker-router hf pull {} --ollama", model);
                         println!("Or register an existing pull:");
-                        println!("  clankers-router hf ollama {}", model);
+                        println!("  clanker-router hf ollama {}", model);
                     }
                 }
                 Err(e) => {
@@ -1486,7 +1486,7 @@ async fn run_hf(cli: &Cli, auth_store: &AuthStore, action: &HfAction) {
             let cached = hub.list_cached();
             if cached.is_empty() {
                 println!("No cached models.");
-                println!("Pull a model with: clankers-router hf pull <model-id>");
+                println!("Pull a model with: clanker-router hf pull <model-id>");
                 return;
             }
             println!("{:<45} {:<30} {:>10} {:<10}", "MODEL", "FILE", "SIZE", "QUANT");
@@ -1534,7 +1534,7 @@ async fn run_hf(cli: &Cli, auth_store: &AuthStore, action: &HfAction) {
                 },
                 None => {
                     eprintln!("Model '{}' not found in cache.", model);
-                    eprintln!("Pull it first: clankers-router hf pull {}", model);
+                    eprintln!("Pull it first: clanker-router hf pull {}", model);
                     std::process::exit(1);
                 }
             }
@@ -1570,7 +1570,7 @@ async fn run_tui(cli: &Cli, auth_store: &AuthStore, system: Option<String>) {
     if router.provider_names().is_empty() {
         eprintln!("Error: No providers configured.");
         eprintln!("Set an API key first:");
-        eprintln!("  clankers-router auth set-key openai sk-...");
+        eprintln!("  clanker-router auth set-key openai sk-...");
         eprintln!("  export OPENAI_API_KEY=sk-...");
         std::process::exit(1);
     }

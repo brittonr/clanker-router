@@ -1,4 +1,4 @@
-//! Integration tests for clankers-router
+//! Integration tests for clanker-router
 //!
 //! Tests cross-module interactions, edge cases, and scenarios not covered
 //! by unit tests in individual modules.
@@ -6,37 +6,37 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use clankers_router::Router;
-use clankers_router::auth::AuthStore;
-use clankers_router::auth::LegacyOAuthCredentials;
-use clankers_router::auth::StoredCredential;
-use clankers_router::auth::env_var_for_provider;
-use clankers_router::auth::is_oauth_token;
-use clankers_router::auth::resolve_credential;
-use clankers_router::error::Error;
-use clankers_router::model::Model;
-use clankers_router::model::ModelAliases;
-use clankers_router::model_switch::ModelSwitchReason;
-use clankers_router::multi::MultiRequest;
-use clankers_router::multi::MultiStrategy;
-use clankers_router::provider::CompletionRequest;
-use clankers_router::provider::Provider;
-use clankers_router::provider::ThinkingConfig;
-use clankers_router::provider::ToolDefinition;
-use clankers_router::provider::Usage;
-use clankers_router::quorum::ConsensusStrategy;
-use clankers_router::quorum::QuorumRequest;
-use clankers_router::quorum::QuorumTarget;
-use clankers_router::registry::ModelRegistry;
-use clankers_router::retry::RetryConfig;
-use clankers_router::retry::is_retryable_error;
-use clankers_router::retry::is_retryable_status;
-use clankers_router::retry::parse_retry_after;
-use clankers_router::streaming::ContentBlock;
-use clankers_router::streaming::ContentDelta;
-use clankers_router::streaming::MessageMetadata;
-use clankers_router::streaming::StreamEvent;
-use clankers_router::streaming::TaggedStreamEvent;
+use clanker_router::Router;
+use clanker_router::auth::AuthStore;
+use clanker_router::auth::LegacyOAuthCredentials;
+use clanker_router::auth::StoredCredential;
+use clanker_router::auth::env_var_for_provider;
+use clanker_router::auth::is_oauth_token;
+use clanker_router::auth::resolve_credential;
+use clanker_router::error::Error;
+use clanker_router::model::Model;
+use clanker_router::model::ModelAliases;
+use clanker_router::model_switch::ModelSwitchReason;
+use clanker_router::multi::MultiRequest;
+use clanker_router::multi::MultiStrategy;
+use clanker_router::provider::CompletionRequest;
+use clanker_router::provider::Provider;
+use clanker_router::provider::ThinkingConfig;
+use clanker_router::provider::ToolDefinition;
+use clanker_router::provider::Usage;
+use clanker_router::quorum::ConsensusStrategy;
+use clanker_router::quorum::QuorumRequest;
+use clanker_router::quorum::QuorumTarget;
+use clanker_router::registry::ModelRegistry;
+use clanker_router::retry::RetryConfig;
+use clanker_router::retry::is_retryable_error;
+use clanker_router::retry::is_retryable_status;
+use clanker_router::retry::parse_retry_after;
+use clanker_router::streaming::ContentBlock;
+use clanker_router::streaming::ContentDelta;
+use clanker_router::streaming::MessageMetadata;
+use clanker_router::streaming::StreamEvent;
+use clanker_router::streaming::TaggedStreamEvent;
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -99,7 +99,7 @@ impl MockProvider {
 
 #[async_trait]
 impl Provider for MockProvider {
-    async fn complete(&self, request: CompletionRequest, tx: mpsc::Sender<StreamEvent>) -> clankers_router::Result<()> {
+    async fn complete(&self, request: CompletionRequest, tx: mpsc::Sender<StreamEvent>) -> clanker_router::Result<()> {
         if let Some(ref err) = self.fail_with {
             return Err(Error::Provider {
                 message: err.clone(),
@@ -170,7 +170,7 @@ fn simple_request(model: &str) -> CompletionRequest {
     }
 }
 
-async fn collect_events(router: &Router, request: CompletionRequest) -> clankers_router::Result<Vec<StreamEvent>> {
+async fn collect_events(router: &Router, request: CompletionRequest) -> clanker_router::Result<Vec<StreamEvent>> {
     let (tx, mut rx) = mpsc::channel(32);
     router.complete(request, tx).await?;
     let mut events = Vec::new();
@@ -1089,8 +1089,8 @@ fn test_completion_request_with_all_fields() {
 
 #[test]
 fn test_openai_compat_provider_creation() {
-    use clankers_router::backends::openai_compat::OpenAICompatConfig;
-    use clankers_router::backends::openai_compat::OpenAICompatProvider;
+    use clanker_router::backends::openai_compat::OpenAICompatConfig;
+    use clanker_router::backends::openai_compat::OpenAICompatProvider;
 
     let config = OpenAICompatConfig::openai("sk-test".into());
     let provider = OpenAICompatProvider::new(config);
@@ -1100,8 +1100,8 @@ fn test_openai_compat_provider_creation() {
 
 #[tokio::test]
 async fn test_openai_compat_provider_is_available() {
-    use clankers_router::backends::openai_compat::OpenAICompatConfig;
-    use clankers_router::backends::openai_compat::OpenAICompatProvider;
+    use clanker_router::backends::openai_compat::OpenAICompatConfig;
+    use clanker_router::backends::openai_compat::OpenAICompatProvider;
 
     let config = OpenAICompatConfig::openai("sk-test".into());
     let provider = OpenAICompatProvider::new(config);
@@ -1267,8 +1267,8 @@ fn test_retry_deterministic_has_no_jitter() {
 
 #[test]
 fn test_circuit_breaker_state_transitions() {
-    use clankers_router::db::rate_limits::CircuitState;
-    use clankers_router::db::rate_limits::RateLimitState;
+    use clanker_router::db::rate_limits::CircuitState;
+    use clanker_router::db::rate_limits::RateLimitState;
 
     let mut state = RateLimitState::new("test", "model");
     assert_eq!(state.effective_circuit(), CircuitState::Closed);
@@ -1287,8 +1287,8 @@ fn test_circuit_breaker_state_transitions() {
 
 #[test]
 fn test_circuit_breaker_halfopen_on_cooldown_expiry() {
-    use clankers_router::db::rate_limits::CircuitState;
-    use clankers_router::db::rate_limits::RateLimitState;
+    use clanker_router::db::rate_limits::CircuitState;
+    use clanker_router::db::rate_limits::RateLimitState;
 
     let mut state = RateLimitState::new("test", "model");
     state.record_error(429, Some(0)); // 0-second cooldown → already expired
@@ -1304,8 +1304,8 @@ fn test_circuit_breaker_halfopen_on_cooldown_expiry() {
 
 #[test]
 fn test_cache_eviction_cleans_expired_entries() {
-    use clankers_router::db::RouterDb;
-    use clankers_router::db::cache::ResponseCache;
+    use clanker_router::db::RouterDb;
+    use clanker_router::db::cache::ResponseCache;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cache-test.db");
@@ -1350,7 +1350,7 @@ impl SlowMockProvider {
 
 #[async_trait]
 impl Provider for SlowMockProvider {
-    async fn complete(&self, request: CompletionRequest, tx: mpsc::Sender<StreamEvent>) -> clankers_router::Result<()> {
+    async fn complete(&self, request: CompletionRequest, tx: mpsc::Sender<StreamEvent>) -> clanker_router::Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
 
         let _ = tx
@@ -1507,7 +1507,7 @@ async fn test_multi_empty_models_returns_error() {
 
 #[tokio::test]
 async fn test_multi_records_usage_to_db() {
-    use clankers_router::db::RouterDb;
+    use clanker_router::db::RouterDb;
 
     let dir = tempfile::tempdir().unwrap();
     let db = RouterDb::open(&dir.path().join("multi-usage.db")).unwrap();
@@ -1690,7 +1690,7 @@ impl TextMockProvider {
 
 #[async_trait]
 impl Provider for TextMockProvider {
-    async fn complete(&self, request: CompletionRequest, tx: mpsc::Sender<StreamEvent>) -> clankers_router::Result<()> {
+    async fn complete(&self, request: CompletionRequest, tx: mpsc::Sender<StreamEvent>) -> clanker_router::Result<()> {
         let _ = tx
             .send(StreamEvent::MessageStart {
                 message: MessageMetadata {

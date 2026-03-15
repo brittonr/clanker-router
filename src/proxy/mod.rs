@@ -1,7 +1,7 @@
 //! OpenAI-compatible HTTP proxy server + iroh p2p tunnel.
 //!
 //! Exposes the router as an OpenAI-compatible API so any tool that supports
-//! `OPENAI_BASE_URL` (Cursor, aider, Continue, etc.) can use clankers-router
+//! `OPENAI_BASE_URL` (Cursor, aider, Continue, etc.) can use clanker-router
 //! as a drop-in replacement.
 //!
 //! # Endpoints

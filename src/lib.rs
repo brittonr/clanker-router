@@ -1,4 +1,4 @@
-//! clankers-router — Model router and auth gateway for LLM providers
+//! clanker-router — Model router and auth gateway for LLM providers
 //!
 //! This crate provides:
 //!
@@ -22,7 +22,7 @@
 //! - **OpenAI-compatible proxy** — HTTP server that exposes the router as an OpenAI API for use
 //!   with Cursor, aider, Continue, etc.
 //! - **iroh p2p tunnel** — QUIC-based remote access to the proxy without port forwarding, plus an
-//!   RPC protocol for clankers ↔ router communication
+//!   RPC protocol for client ↔ router communication
 //!
 //! # Supported Providers
 //!

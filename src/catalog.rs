@@ -112,7 +112,7 @@ impl ModelCatalog {
     }
 
     /// Generate a default catalog file from built-in model lists
-    /// (useful for `clankers router init` or first-run).
+    /// (useful for `clanker-router init` or first-run).
     pub fn from_builtin_models(models: &[Model]) -> Self {
         Self {
             models: models.to_vec(),

@@ -79,8 +79,8 @@ impl OpenAICompatConfig {
             base_url: "https://openrouter.ai/api/v1".to_string(),
             api_key,
             extra_headers: vec![
-                ("HTTP-Referer".to_string(), "https://github.com/clankers".to_string()),
-                ("X-Title".to_string(), "clankers".to_string()),
+                ("HTTP-Referer".to_string(), "https://github.com/brittonr/clanker-router".to_string()),
+                ("X-Title".to_string(), "clanker-router".to_string()),
             ],
             models: openrouter_models(),
             timeout: Duration::from_secs(300),

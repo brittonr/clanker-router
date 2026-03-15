@@ -1,15 +1,16 @@
 [package]
-name = "clankers-router"
+name = "clanker-router"
 version = "0.1.0"
-edition.workspace = true
-license.workspace = true
+edition = "2024"
+license = "MIT"
 description = "Model router and auth gateway for LLM providers"
 keywords = ["llm", "router", "auth", "openai", "anthropic"]
 categories = ["authentication", "web-programming"]
+repository = "https://github.com/brittonr/clanker-router"
 
 [[bin]]
-name = "clankers-router"
-path = "src/bin/clankers_router/main.rs"
+name = "clanker-router"
+path = "src/bin/clanker_router/main.rs"
 required-features = ["cli"]
 
 [features]
@@ -21,26 +22,26 @@ cli = ["dep:clap", "dep:ratatui", "dep:crossterm", "dep:tracing-subscriber", "de
 [dependencies]
 async-trait = "0.1"
 base64 = "0.22"
-chrono = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
 futures-buffered = "0.2"
 futures-lite = "2.6"
 fs4 = { version = "0.13", features = ["tokio"] }
 hex = "0.4"
-rand = { workspace = true }
+rand = "0.9"
 redb = "2.6"
-reqwest = { workspace = true }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 reqwest-eventsource = "0.6"
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
-thiserror = { workspace = true }
-tokio = { workspace = true }
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "io-util", "signal", "process"] }
 tokio-stream = "0.1.18"
 tokio-util = { version = "0.7.18", features = ["io"] }
-tracing = { workspace = true }
+tracing = "0.1"
 url = "2"
 urlencoding = "2.1"
-uuid = { workspace = true }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # Proxy server dependencies (optional)
 axum = { version = "0.8", features = ["json"], optional = true }
@@ -62,5 +63,38 @@ tempfile = "3"
 tokio-test = "0.4"
 tower = { version = "0.5", features = ["util"] }
 
-[lints]
-workspace = true
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+doc_markdown = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+needless_pass_by_value = "allow"
+uninlined_format_args = "allow"
+wildcard_imports = "allow"
+match_same_arms = "allow"
+single_match_else = "allow"
+map_unwrap_or = "allow"
+return_self_not_must_use = "allow"
+struct_excessive_bools = "allow"
+redundant_closure_for_method_calls = "allow"
+items_after_statements = "allow"
+duration_suboptimal_units = "allow"
+missing_fields_in_debug = "allow"
+doc_link_with_quotes = "allow"
+needless_lifetimes = "allow"
+manual_let_else = "allow"
+unnecessary_wraps = "allow"
+nonminimal_bool = "allow"
+type_complexity = "allow"
+needless_borrowed_reference = "allow"
+unnecessary_literal_bound = "allow"
+elidable_lifetime_names = "allow"
+if_not_else = "allow"

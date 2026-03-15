@@ -22,7 +22,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use clankers_router::quorum::*;
+//! use clanker_router::quorum::*;
 //!
 //! let quorum_req = QuorumRequest {
 //!     request: base_request,

@@ -1,6 +1,6 @@
 //! Router RPC client
 //!
-//! Connects to a running clankers-router daemon and sends completion requests,
+//! Connects to a running clanker-router daemon and sends completion requests,
 //! model queries, and status checks over iroh QUIC.
 
 use iroh::Endpoint;
@@ -22,7 +22,7 @@ use crate::model::Model;
 use crate::provider::CompletionRequest;
 use crate::streaming::StreamEvent;
 
-/// Client for connecting to a clankers-router daemon.
+/// Client for connecting to a clanker-router daemon.
 pub struct RpcClient {
     endpoint: Endpoint,
     remote: EndpointAddr,

@@ -1,4 +1,4 @@
-//! Interactive TUI chat for clankers-router
+//! Interactive TUI chat for clanker-router
 //!
 //! A minimal ratatui-based chat interface that streams completions
 //! from the router in real-time.
@@ -6,10 +6,10 @@
 use std::io;
 use std::sync::Arc;
 
-use clankers_router::Router;
-use clankers_router::provider::CompletionRequest;
-use clankers_router::streaming::ContentDelta;
-use clankers_router::streaming::StreamEvent;
+use clanker_router::Router;
+use clanker_router::provider::CompletionRequest;
+use clanker_router::streaming::ContentDelta;
+use clanker_router::streaming::StreamEvent;
 use crossterm::event::Event;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -488,7 +488,7 @@ fn draw(app: &App, frame: &mut Frame) {
 
 fn draw_header(app: &App, frame: &mut Frame, area: Rect) {
     let header = Paragraph::new(Line::from(vec![
-        Span::styled(" clankers-router ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+        Span::styled(" clanker-router ", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
         Span::styled(format!(" {} ", app.model), Style::default().fg(Color::Cyan)),
         Span::styled(" Ctrl+C quit  Enter send  Ctrl+M model  /help ", Style::default().fg(Color::DarkGray)),
     ]));
@@ -507,7 +507,7 @@ fn draw_messages(app: &App, frame: &mut Frame, area: Rect) {
         let welcome = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  Welcome to clankers-router chat!",
+                "  Welcome to clanker-router chat!",
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
