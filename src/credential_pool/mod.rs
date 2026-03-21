@@ -143,6 +143,23 @@ struct CredentialSlot {
     health: RwLock<SlotHealth>,
 }
 
+impl CredentialSlot {
+    /// Whether this slot can be used for a request.
+    ///
+    /// A slot is selectable when:
+    /// - The credential hasn't expired (OAuth tokens have a TTL)
+    /// - The health circuit breaker allows traffic
+    ///
+    /// Expired OAuth tokens are skipped rather than used — they'd just
+    /// get a 401 from the API anyway.
+    async fn is_selectable(&self) -> bool {
+        if self.credential.is_expired() {
+            return false;
+        }
+        self.health.read().await.is_available()
+    }
+}
+
 // ── Credential pool ─────────────────────────────────────────────────────
 
 /// Thread-safe pool of credentials with load balancing and failover.
@@ -286,7 +303,7 @@ impl CredentialPool {
                 let start = self.rr_counter.fetch_add(1, Ordering::Relaxed) % self.slots.len();
                 for i in 0..self.slots.len() {
                     let idx = (start + i) % self.slots.len();
-                    if self.slots[idx].health.read().await.is_available() {
+                    if self.slots[idx].is_selectable().await {
                         leases.push(CredentialLease {
                             pool: self,
                             slot_index: idx,
@@ -296,7 +313,7 @@ impl CredentialPool {
             }
             SelectionStrategy::Failover => {
                 for (idx, slot) in self.slots.iter().enumerate() {
-                    if slot.health.read().await.is_available() {
+                    if slot.is_selectable().await {
                         leases.push(CredentialLease {
                             pool: self,
                             slot_index: idx,
@@ -314,11 +331,13 @@ impl CredentialPool {
         let mut summaries = Vec::with_capacity(self.slots.len());
         for (i, slot) in self.slots.iter().enumerate() {
             let health = slot.health.read().await;
+            let is_expired = slot.credential.is_expired();
             summaries.push(SlotSummary {
                 index: i,
                 account: slot.account.clone(),
                 is_oauth: slot.credential.is_oauth(),
-                is_available: health.is_available(),
+                is_expired,
+                is_available: !is_expired && health.is_available(),
                 in_cooldown: health.in_cooldown,
                 cooldown_remaining_secs: health.cooldown_remaining_secs(),
                 consecutive_errors: health.consecutive_errors,
@@ -364,7 +383,7 @@ impl CredentialPool {
         // Try from the RR position forward, wrapping around
         for i in 0..self.slots.len() {
             let idx = (start + i) % self.slots.len();
-            if self.slots[idx].health.read().await.is_available() {
+            if self.slots[idx].is_selectable().await {
                 if i > 0 {
                     debug!("round-robin skipped {} unavailable slot(s), using '{}'", i, self.slots[idx].account);
                 }
@@ -375,14 +394,24 @@ impl CredentialPool {
             }
         }
 
-        warn!("all {} credential(s) in cooldown", self.slots.len());
+        // Distinguish between "all in cooldown" and "all expired" for diagnostics
+        let expired = self.slots.iter().filter(|s| s.credential.is_expired()).count();
+        if expired > 0 {
+            warn!(
+                "all {} credential(s) unavailable ({} expired OAuth token(s) — re-login to fix)",
+                self.slots.len(),
+                expired,
+            );
+        } else {
+            warn!("all {} credential(s) in cooldown", self.slots.len());
+        }
         None
     }
 
     async fn select_failover(&self) -> Option<CredentialLease<'_>> {
         // Try the primary (index 0) first, then fall through
         for (idx, slot) in self.slots.iter().enumerate() {
-            if slot.health.read().await.is_available() {
+            if slot.is_selectable().await {
                 if idx > 0 {
                     info!("failing over from '{}' to '{}'", self.slots[0].account, slot.account);
                 }
@@ -393,7 +422,16 @@ impl CredentialPool {
             }
         }
 
-        warn!("all {} credential(s) in cooldown", self.slots.len());
+        let expired = self.slots.iter().filter(|s| s.credential.is_expired()).count();
+        if expired > 0 {
+            warn!(
+                "all {} credential(s) unavailable ({} expired OAuth token(s) — re-login to fix)",
+                self.slots.len(),
+                expired,
+            );
+        } else {
+            warn!("all {} credential(s) in cooldown", self.slots.len());
+        }
         None
     }
 }
@@ -406,6 +444,7 @@ pub struct SlotSummary {
     pub index: usize,
     pub account: String,
     pub is_oauth: bool,
+    pub is_expired: bool,
     pub is_available: bool,
     pub in_cooldown: bool,
     pub cooldown_remaining_secs: u64,
@@ -417,7 +456,9 @@ pub struct SlotSummary {
 
 impl std::fmt::Display for SlotSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let status = if self.is_available {
+        let status = if self.is_expired {
+            "✗ expired"
+        } else if self.is_available {
             "✓ healthy"
         } else {
             "✗ cooldown"
