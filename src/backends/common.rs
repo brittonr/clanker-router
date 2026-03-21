@@ -399,4 +399,247 @@ mod tests {
         let client = build_http_client(Duration::from_secs(60));
         assert!(client.is_ok());
     }
+
+    // ── SSE line reader tests ───────────────────────────────────────
+
+    /// Build an SseLineReader from raw SSE text for testing.
+    fn sse_reader_from_bytes(data: &[u8]) -> SseLineReader {
+        let stream: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = std::result::Result<tokio_util::bytes::Bytes, std::io::Error>> + Send>> = Box::pin(
+            tokio_stream::once(Ok(tokio_util::bytes::Bytes::copy_from_slice(data)))
+        );
+        let reader = tokio_util::io::StreamReader::new(stream);
+        let lines = tokio::io::BufReader::new(reader).lines();
+        SseLineReader { lines }
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_basic_event() {
+        let data = b"event: message\ndata: {\"key\": \"value\"}\n\n";
+        let mut reader = sse_reader_from_bytes(data);
+
+        let event = reader.next_event().await.unwrap().expect("should have event");
+        assert_eq!(event.event_type(), "message");
+        assert_eq!(event.data, "{\"key\": \"value\"}");
+
+        let end = reader.next_event().await.unwrap();
+        assert!(end.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_multiple_events() {
+        let data = b"event: alpha\ndata: first\n\nevent: beta\ndata: second\n\n";
+        let mut reader = sse_reader_from_bytes(data);
+
+        let e1 = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(e1.event_type(), "alpha");
+        assert_eq!(e1.data, "first");
+
+        let e2 = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(e2.event_type(), "beta");
+        assert_eq!(e2.data, "second");
+
+        assert!(reader.next_event().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_data_only_event() {
+        // No "event:" line — event_type defaults to "message"
+        let data = b"data: hello\n\n";
+        let mut reader = sse_reader_from_bytes(data);
+
+        let event = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(event.event_type(), "message");
+        assert_eq!(event.data, "hello");
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_multiline_data() {
+        // Multiple data: lines get joined with newlines
+        let data = b"data: line1\ndata: line2\ndata: line3\n\n";
+        let mut reader = sse_reader_from_bytes(data);
+
+        let event = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(event.data, "line1\nline2\nline3");
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_comments_ignored() {
+        let data = b": this is a comment\nevent: msg\n: another comment\ndata: payload\n\n";
+        let mut reader = sse_reader_from_bytes(data);
+
+        let event = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(event.event_type(), "msg");
+        assert_eq!(event.data, "payload");
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_empty_lines_between_events() {
+        // Extra blank lines between events should be tolerated
+        let data = b"\n\nevent: first\ndata: a\n\n\n\nevent: second\ndata: b\n\n";
+        let mut reader = sse_reader_from_bytes(data);
+
+        let e1 = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(e1.data, "a");
+
+        let e2 = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(e2.data, "b");
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_done_marker() {
+        let data = b"data: [DONE]\n\n";
+        let mut reader = sse_reader_from_bytes(data);
+
+        let event = reader.next_event().await.unwrap().unwrap();
+        assert!(event.is_done());
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_empty_stream() {
+        let data = b"";
+        let mut reader = sse_reader_from_bytes(data);
+        assert!(reader.next_event().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_event_at_eof_without_trailing_newline() {
+        // Stream ends without the final \n\n — should still yield the event
+        let data = b"event: eof\ndata: last";
+        let mut reader = sse_reader_from_bytes(data);
+
+        let event = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(event.event_type(), "eof");
+        assert_eq!(event.data, "last");
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_json_data() {
+        let json = r#"{"type":"text_delta","text":"Hello"}"#;
+        let data = format!("event: content_block_delta\ndata: {}\n\n", json);
+        let mut reader = sse_reader_from_bytes(data.as_bytes());
+
+        let event = reader.next_event().await.unwrap().unwrap();
+        let parsed = event.parse_json().expect("should parse JSON");
+        assert_eq!(parsed["type"], "text_delta");
+        assert_eq!(parsed["text"], "Hello");
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_malformed_json() {
+        let data = b"data: {broken json\n\n";
+        let mut reader = sse_reader_from_bytes(data);
+
+        let event = reader.next_event().await.unwrap().unwrap();
+        assert!(event.parse_json().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_chunked_delivery() {
+        // Simulate data arriving in multiple chunks (as in real HTTP streaming)
+        let chunk1 = b"event: msg\n".to_vec();
+        let chunk2 = b"data: hello".to_vec();
+        let chunk3 = b" world\n\n".to_vec();
+
+        let chunks = vec![
+            Ok(tokio_util::bytes::Bytes::from(chunk1)),
+            Ok(tokio_util::bytes::Bytes::from(chunk2)),
+            Ok(tokio_util::bytes::Bytes::from(chunk3)),
+        ];
+
+        let stream: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = std::result::Result<tokio_util::bytes::Bytes, std::io::Error>> + Send>> = Box::pin(
+            tokio_stream::iter(chunks)
+        );
+        let reader_inner = tokio_util::io::StreamReader::new(stream);
+        let lines = tokio::io::BufReader::new(reader_inner).lines();
+        let mut reader = SseLineReader { lines };
+
+        let event = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(event.event_type(), "msg");
+        assert_eq!(event.data, "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_anthropic_style_stream() {
+        // Simulate a realistic Anthropic SSE stream
+        let stream_data = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"model\":\"claude-sonnet-4-5-20250514\",\"role\":\"assistant\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: ping\n",
+            "data: {}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world!\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let mut reader = sse_reader_from_bytes(stream_data.as_bytes());
+
+        // message_start
+        let e = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(e.event_type(), "message_start");
+        let j = e.parse_json().unwrap();
+        assert_eq!(j["message"]["id"], "msg_1");
+
+        // content_block_start
+        let e = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(e.event_type(), "content_block_start");
+
+        // ping
+        let e = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(e.event_type(), "ping");
+
+        // content_block_delta x2
+        let e = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(e.event_type(), "content_block_delta");
+        let j = e.parse_json().unwrap();
+        assert_eq!(j["delta"]["text"], "Hello");
+
+        let e = reader.next_event().await.unwrap().unwrap();
+        let j = e.parse_json().unwrap();
+        assert_eq!(j["delta"]["text"], " world!");
+
+        // content_block_stop
+        let e = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(e.event_type(), "content_block_stop");
+
+        // message_delta
+        let e = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(e.event_type(), "message_delta");
+        let j = e.parse_json().unwrap();
+        assert_eq!(j["delta"]["stop_reason"], "end_turn");
+
+        // message_stop
+        let e = reader.next_event().await.unwrap().unwrap();
+        assert_eq!(e.event_type(), "message_stop");
+
+        // end
+        assert!(reader.next_event().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sse_reader_openai_style_done() {
+        // OpenAI-compatible streams end with data: [DONE]
+        let data = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let mut reader = sse_reader_from_bytes(data.as_bytes());
+
+        let e1 = reader.next_event().await.unwrap().unwrap();
+        assert!(!e1.is_done());
+        assert!(e1.parse_json().is_ok());
+
+        let e2 = reader.next_event().await.unwrap().unwrap();
+        assert!(e2.is_done());
+    }
+
 }
