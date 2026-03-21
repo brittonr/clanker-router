@@ -169,13 +169,26 @@ impl AuthStore {
         store
     }
 
-    /// Save auth store to a file path
+    /// Save auth store to a file path.
+    ///
+    /// Sets restrictive file permissions (0600) since the file contains
+    /// plaintext API keys and OAuth tokens.
     pub fn save(&self, path: &Path) -> crate::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        std::fs::write(path, &json)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
@@ -598,6 +611,52 @@ mod tests {
 
         let loaded = AuthStore::load(&path);
         assert_eq!(loaded.active_credential("anthropic").unwrap().token(), "test-key");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_sets_restrictive_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("secure");
+        let path = subdir.join("auth.json");
+
+        let mut store = AuthStore::default();
+        store.set_credential("anthropic", "default", StoredCredential::ApiKey {
+            api_key: "secret-key".into(),
+            label: None,
+        });
+        store.save(&path).unwrap();
+
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "auth file should be owner-only read/write, got {:#o}", file_mode);
+
+        let dir_mode = std::fs::metadata(&subdir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "auth dir should be owner-only, got {:#o}", dir_mode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_tightens_existing_loose_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+
+        // Create with loose permissions first
+        std::fs::write(&path, "{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut store = AuthStore::load(&path);
+        store.set_credential("anthropic", "default", StoredCredential::ApiKey {
+            api_key: "key".into(),
+            label: None,
+        });
+        store.save(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "save should tighten loose permissions, got {:#o}", mode);
     }
 
     #[test]
