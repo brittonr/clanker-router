@@ -288,14 +288,17 @@ fn build_providers(cli: &Cli, auth_store: &AuthStore) -> Vec<Arc<dyn Provider>> 
             }
         }
 
-        // Add env var as an extra source (if not already present)
-        if let Some(env_var) = env_var_for_provider(name)
-            && let Ok(key) = std::env::var(env_var)
-            && !key.is_empty()
-        {
-            let env_label = format!("env:{}", env_var);
-            let already_has = creds.iter().any(|(_, c)| c.token() == key);
-            if !already_has {
+        // Use env var ONLY as a fallback when the auth store has no
+        // credentials for this provider. This prevents dummy/proxy API
+        // keys (e.g. ANTHROPIC_API_KEY=sk-ant-proxy set by a co-hosted
+        // daemon) from contaminating the credential pool alongside real
+        // OAuth tokens from the auth store.
+        if creds.is_empty() {
+            if let Some(env_var) = env_var_for_provider(name)
+                && let Ok(key) = std::env::var(env_var)
+                && !key.is_empty()
+            {
+                let env_label = format!("env:{}", env_var);
                 creds.push((env_label.clone(), StoredCredential::ApiKey {
                     api_key: key,
                     label: Some(env_label),
