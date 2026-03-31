@@ -303,6 +303,16 @@ impl AnthropicProvider {
 // ── Request building ────────────────────────────────────────────────────
 
 fn build_request_body(request: &CompletionRequest, is_oauth: bool) -> Result<Value> {
+    build_request_body_inner(request, is_oauth)
+}
+
+/// Test-visible wrapper for `build_request_body`.
+#[cfg(test)]
+pub fn build_request_body_for_test(request: &CompletionRequest, is_oauth: bool) -> Result<Value> {
+    build_request_body_inner(request, is_oauth)
+}
+
+fn build_request_body_inner(request: &CompletionRequest, is_oauth: bool) -> Result<Value> {
     let mut body = json!({
         "model": request.model,
         "messages": request.messages,
@@ -319,9 +329,15 @@ fn build_request_body(request: &CompletionRequest, is_oauth: bool) -> Result<Val
         body["temperature"] = json!(temp);
     }
 
-    // System prompt — both OAuth and API key support prompt caching.
-    // OAuth additionally requires the Claude Code identity prefix.
-    if is_oauth {
+    // System prompt handling:
+    // 1. If _anthropic_system is set (request came through the native Anthropic
+    //    proxy endpoint), use those pre-built blocks directly — they already
+    //    have the client's cache_control annotations.
+    // 2. Otherwise, construct system blocks from the plain-text system_prompt.
+    //    OAuth additionally requires the Claude Code identity prefix.
+    if let Some(raw_system) = request.extra_params.get("_anthropic_system") {
+        body["system"] = raw_system.clone();
+    } else if is_oauth {
         let mut blocks = vec![json!({
             "type": "text",
             "text": "You are Claude Code, Anthropic's official CLI for Claude.",

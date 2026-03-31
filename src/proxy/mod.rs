@@ -1,12 +1,13 @@
-//! OpenAI-compatible HTTP proxy server + iroh p2p tunnel.
+//! HTTP proxy server — OpenAI-compatible + native Anthropic endpoints.
 //!
-//! Exposes the router as an OpenAI-compatible API so any tool that supports
-//! `OPENAI_BASE_URL` (Cursor, aider, Continue, etc.) can use clanker-router
-//! as a drop-in replacement.
+//! Exposes the router as both an OpenAI-compatible API (for Cursor, aider,
+//! Continue, etc.) and a native Anthropic Messages API (for clankers and
+//! other Anthropic-native clients that need full feature fidelity).
 //!
 //! # Endpoints
 //!
-//! - `POST /v1/chat/completions` — streaming + non-streaming completions
+//! - `POST /v1/chat/completions` — OpenAI-format streaming + non-streaming completions
+//! - `POST /v1/messages`         — native Anthropic Messages API (streaming only)
 //! - `GET  /v1/models`           — list available models
 //! - `GET  /health`              — health check
 //!
@@ -20,6 +21,8 @@
 //!
 //! Accepts `Authorization: Bearer <key>` headers. The proxy validates against
 //! a configured set of allowed keys (or allows all if none are configured).
+
+pub mod anthropic;
 
 #[cfg(feature = "rpc")]
 pub mod iroh_tunnel;
@@ -886,10 +889,12 @@ impl Default for ProxyConfig {
 pub fn build_app(state: Arc<ProxyState>) -> AxumRouter {
     AxumRouter::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(anthropic::anthropic_messages))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
         // Also handle without /v1 prefix for flexibility
         .route("/chat/completions", post(chat_completions))
+        .route("/messages", post(anthropic::anthropic_messages))
         .route("/models", get(list_models))
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -924,3 +929,7 @@ pub async fn serve(router: Arc<Router>, config: ProxyConfig) -> crate::Result<()
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "anthropic_tests.rs"]
+mod anthropic_tests;
