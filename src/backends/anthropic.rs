@@ -257,6 +257,12 @@ impl AnthropicProvider {
                 }
             }
 
+            debug!(
+                "anthropic request body (attempt {}): {}",
+                attempt,
+                serde_json::to_string(body).unwrap_or_else(|_| "<serialize error>".into()),
+            );
+
             let resp = builder.json(body).send().await.map_err(|e| Error::Provider {
                 message: format!("Anthropic request failed: {}", e),
                 status: None,
@@ -321,6 +327,20 @@ fn build_request_body_inner(request: &CompletionRequest, is_oauth: bool) -> Resu
         let mut body = raw.clone();
         body["model"] = json!(request.model);
         body["stream"] = json!(true);
+
+        // Anthropic requires temperature to be omitted when thinking is
+        // enabled.  The old typed handler stripped it; the raw passthrough
+        // must do the same or Anthropic returns 400.
+        if body.get("thinking")
+            .and_then(|t| t.get("type"))
+            .and_then(|t| t.as_str())
+            == Some("enabled")
+        {
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("temperature");
+            }
+        }
+
         return Ok(body);
     }
 

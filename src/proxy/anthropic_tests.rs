@@ -642,7 +642,10 @@ fn raw_passthrough_preserves_full_body() {
     assert_eq!(body["model"], "claude-sonnet-4-5-20250514");
     assert_eq!(body["max_tokens"], 16384);
     assert_eq!(body["stream"], true);
-    assert_eq!(body["temperature"], 1.0);
+
+    // temperature must be stripped when thinking is enabled (Anthropic rejects it)
+    assert!(body.get("temperature").is_none() || body["temperature"].is_null(),
+        "temperature must be omitted when thinking is enabled");
 
     // System blocks with cache_control intact
     let system = body["system"].as_array().unwrap();
@@ -750,4 +753,67 @@ fn system_cache_control_round_trip_via_typed_path() {
     assert_eq!(system[0]["text"], "You are a helpful assistant.");
     assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
     assert_eq!(system[1]["cache_control"]["ttl"], "1h");
+}
+
+// ── 5.7 Raw passthrough: temperature + thinking interaction ────────────
+
+#[test]
+fn raw_passthrough_strips_temperature_when_thinking_enabled() {
+    use crate::backends::anthropic::build_request_body_for_test;
+
+    let raw = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 16384,
+        "stream": true,
+        "temperature": 0.7,
+        "thinking": {"type": "enabled", "budget_tokens": 10000}
+    });
+
+    let cr = convert_raw_to_completion_request(raw);
+    let body = build_request_body_for_test(&cr, false).unwrap();
+
+    // Anthropic rejects temperature when thinking is enabled
+    assert!(body.get("temperature").is_none(),
+        "temperature must be stripped when thinking is enabled");
+    // thinking itself is preserved
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["thinking"]["budget_tokens"], 10000);
+}
+
+#[test]
+fn raw_passthrough_preserves_temperature_without_thinking() {
+    use crate::backends::anthropic::build_request_body_for_test;
+
+    let raw = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1024,
+        "stream": true,
+        "temperature": 0.7
+    });
+
+    let cr = convert_raw_to_completion_request(raw);
+    let body = build_request_body_for_test(&cr, false).unwrap();
+
+    // Without thinking, temperature passes through
+    assert_eq!(body["temperature"], 0.7);
+}
+
+#[test]
+fn raw_passthrough_no_temperature_no_thinking() {
+    use crate::backends::anthropic::build_request_body_for_test;
+
+    let raw = json!({
+        "model": "claude-sonnet-4-20250514",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1024,
+        "stream": true
+    });
+
+    let cr = convert_raw_to_completion_request(raw);
+    let body = build_request_body_for_test(&cr, false).unwrap();
+
+    assert!(body.get("temperature").is_none());
+    assert!(body.get("thinking").is_none());
 }
