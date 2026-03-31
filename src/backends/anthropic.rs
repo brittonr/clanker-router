@@ -313,6 +313,17 @@ pub fn build_request_body_for_test(request: &CompletionRequest, is_oauth: bool) 
 }
 
 fn build_request_body_inner(request: &CompletionRequest, is_oauth: bool) -> Result<Value> {
+    // Raw passthrough: if the request came through the Anthropic proxy
+    // endpoint, the entire original JSON body is stored here. Forward
+    // it as-is, only updating `model` (may differ due to fallback) and
+    // ensuring `stream: true`.
+    if let Some(raw) = request.extra_params.get("_anthropic_raw_body") {
+        let mut body = raw.clone();
+        body["model"] = json!(request.model);
+        body["stream"] = json!(true);
+        return Ok(body);
+    }
+
     let mut body = json!({
         "model": request.model,
         "messages": request.messages,

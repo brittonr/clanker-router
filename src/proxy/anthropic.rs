@@ -5,6 +5,12 @@
 //! rotation, rate limits, fallbacks, usage recording), and streams back
 //! native Anthropic SSE events.
 //!
+//! The request body is forwarded to Anthropic **as-is** (raw JSON
+//! passthrough). The proxy only extracts `model` for routing and
+//! validates `stream: true`. No fields are parsed and reconstructed —
+//! tool definitions, system blocks, cache_control annotations, metadata,
+//! tool_choice, and any future API fields pass through untouched.
+//!
 //! This lets clankers (which speaks native Anthropic) use the router for
 //! load balancing without losing Anthropic-specific features (prompt
 //! caching breakpoints, extended thinking signatures, cache token reporting).
@@ -20,6 +26,7 @@ use axum::response::Response;
 use axum::response::sse::Event as SseEvent;
 use axum::response::sse::KeepAlive;
 use axum::response::sse::Sse;
+#[cfg(test)]
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
@@ -30,16 +37,20 @@ use tracing::warn;
 
 use super::ProxyState;
 use crate::provider::CompletionRequest;
-use crate::provider::ThinkingConfig;
-use crate::provider::ToolDefinition;
 use crate::streaming::ContentBlock;
 use crate::streaming::ContentDelta;
 use crate::streaming::StreamEvent;
 
-// ── Anthropic request types ─────────────────────────────────────────────
+// ── Anthropic request types (used by tests and conversion utilities) ────
 
 /// Top-level Anthropic Messages API request body.
+///
+/// NOTE: The proxy handler does NOT use this for deserialization.
+/// It accepts raw `Value` for lossless passthrough. This struct exists
+/// for tests and for `convert_anthropic_request` (used by non-proxy paths).
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub(crate) struct AnthropicRequest {
     pub model: String,
     pub messages: Vec<Value>,
@@ -57,6 +68,7 @@ pub(crate) struct AnthropicRequest {
 }
 
 /// Anthropic tool definition.
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct AnthropicTool {
     pub name: String,
@@ -64,10 +76,10 @@ pub(crate) struct AnthropicTool {
     pub description: Option<String>,
     #[serde(default)]
     pub input_schema: Option<Value>,
-    // cache_control passed through in raw JSON
 }
 
 /// Anthropic thinking configuration.
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub(crate) enum AnthropicThinking {
@@ -80,19 +92,74 @@ pub(crate) enum AnthropicThinking {
     Disabled,
 }
 
+#[cfg(test)]
 fn default_budget() -> usize {
     10000
 }
 
 // ── Request conversion ──────────────────────────────────────────────────
 
-/// Convert an Anthropic Messages API request into the router's `CompletionRequest`.
+/// Convert a raw Anthropic JSON body into a `CompletionRequest` for routing.
 ///
-/// Messages pass through as `Vec<Value>` (the Anthropic backend already
-/// expects this format). System blocks are preserved in
-/// `extra_params["_anthropic_system"]` for round-trip fidelity, with a
-/// plain-text `system_prompt` extracted for non-Anthropic fallback backends.
+/// The entire raw body is stored in `extra_params["_anthropic_raw_body"]`
+/// so the Anthropic backend can forward it as-is. We only extract the
+/// fields the router needs for model resolution, caching, and fallback.
+pub(crate) fn convert_raw_to_completion_request(raw: Value) -> CompletionRequest {
+    let model = raw
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Extract messages for cache key computation
+    let messages: Vec<Value> = raw
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Extract plain-text system prompt for non-Anthropic fallback backends
+    let system_prompt = raw.get("system").and_then(|s| {
+        s.as_array().and_then(|arr| {
+            let parts: Vec<&str> = arr
+                .iter()
+                .filter_map(|b| {
+                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        b.get("text").and_then(|t| t.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if parts.is_empty() { None } else { Some(parts.join("\n\n")) }
+        }).or_else(|| s.as_str().map(|s| s.to_string()))
+    });
+
+    let mut extra_params = std::collections::HashMap::new();
+    extra_params.insert("_anthropic_raw_body".to_string(), raw);
+
+    CompletionRequest {
+        model,
+        messages,
+        system_prompt,
+        max_tokens: None,
+        temperature: None,
+        tools: vec![],
+        thinking: None,
+        no_cache: true, // client owns caching; don't mutate the body
+        cache_ttl: None,
+        extra_params,
+    }
+}
+
+/// Convert a typed `AnthropicRequest` into a `CompletionRequest`.
+///
+/// Kept for tests and any non-proxy code paths that build typed requests.
+#[cfg(test)]
 pub(crate) fn convert_anthropic_request(req: AnthropicRequest) -> CompletionRequest {
+    use crate::provider::ThinkingConfig;
+    use crate::provider::ToolDefinition;
+
     let mut extra_params = std::collections::HashMap::new();
 
     // Preserve raw system blocks for the Anthropic backend
@@ -348,17 +415,41 @@ fn check_auth_anthropic(state: &ProxyState, headers: &HeaderMap) -> Result<(), R
 // ── Handler ─────────────────────────────────────────────────────────────
 
 /// `POST /v1/messages` — native Anthropic Messages API endpoint.
+///
+/// Accepts the raw JSON body and forwards it through the router to
+/// Anthropic as-is. Only `model` (for routing) and `stream` (must be
+/// true) are inspected. All other fields — tools, system, metadata,
+/// tool_choice, cache_control annotations, thinking config, etc. —
+/// pass through untouched.
 pub(crate) async fn anthropic_messages(
     State(state): State<Arc<ProxyState>>,
     headers: HeaderMap,
-    axum::Json(body): axum::Json<AnthropicRequest>,
+    axum::Json(body): axum::Json<Value>,
 ) -> Response {
     if let Err(resp) = check_auth_anthropic(&state, &headers) {
         return resp;
     }
 
+    // Validate: model is required
+    if body.get("model").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+        return anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "The \"model\" field is required",
+        );
+    }
+
+    // Validate: messages is required
+    if body.get("messages").and_then(|v| v.as_array()).is_none() {
+        return anthropic_error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "The \"messages\" field is required and must be an array",
+        );
+    }
+
     // Validate: stream must be true
-    match body.stream {
+    match body.get("stream").and_then(|v| v.as_bool()) {
         Some(true) => {}
         Some(false) => {
             return anthropic_error_response(
@@ -376,7 +467,7 @@ pub(crate) async fn anthropic_messages(
         }
     }
 
-    let request = convert_anthropic_request(body);
+    let request = convert_raw_to_completion_request(body);
 
     debug!(
         "anthropic proxy: streaming completion for model={} messages={}",

@@ -556,74 +556,138 @@ async fn anthropic_endpoint_no_auth_when_unconfigured() {
 }
 
 #[tokio::test]
-async fn anthropic_endpoint_rejects_missing_fields() {
+async fn anthropic_endpoint_rejects_missing_model() {
     let app = make_test_app();
 
-    // Missing model - serde will reject
     let body = json!({
         "messages": [{"role": "user", "content": "hi"}],
         "max_tokens": 256,
         "stream": true,
     });
     let (status, resp) = request_raw(&app, "/v1/messages", body, None).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    // Axum returns 422 for deserialization failures
-    assert!(!resp.is_empty());
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["error"]["type"], "invalid_request_error");
 }
 
-// ── 5.5 Integration test: system cache_control round-trip ───────────────
+#[tokio::test]
+async fn anthropic_endpoint_rejects_missing_messages() {
+    let app = make_test_app();
+
+    let body = json!({
+        "model": "test-model",
+        "max_tokens": 256,
+        "stream": true,
+    });
+    let (status, resp) = request_raw(&app, "/v1/messages", body, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let v: Value = serde_json::from_str(&resp).unwrap();
+    assert_eq!(v["error"]["type"], "invalid_request_error");
+}
+
+// ── 5.5 Raw passthrough tests ────────────────────────────────────────
 
 #[test]
-fn system_cache_control_round_trip() {
+fn raw_passthrough_preserves_full_body() {
     use crate::backends::anthropic::build_request_body_for_test;
 
-    let system_blocks = vec![
-        json!({
-            "type": "text",
-            "text": "You are a helpful assistant.",
-            "cache_control": {"type": "ephemeral"}
-        }),
-        json!({
-            "type": "text",
-            "text": "Additional context here.",
-            "cache_control": {"type": "ephemeral", "ttl": "1h"}
-        }),
-    ];
+    // A realistic clankers request with all the fields the old handler dropped
+    let raw = json!({
+        "model": "claude-sonnet-4-5-20250514",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hello"}]}
+        ],
+        "max_tokens": 16384,
+        "stream": true,
+        "system": [
+            {
+                "type": "text",
+                "text": "You are a helpful assistant.",
+                "cache_control": {"type": "ephemeral"}
+            },
+            {
+                "type": "text",
+                "text": "Additional context.",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }
+        ],
+        "tools": [
+            {
+                "name": "bash",
+                "description": "Run a command",
+                "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+                "cache_control": {"type": "ephemeral"}
+            },
+            {
+                "name": "read",
+                "description": "Read a file",
+                "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral"}
+            }
+        ],
+        "tool_choice": {"type": "auto"},
+        "metadata": {"user_id": "test-user"},
+        "thinking": {"type": "enabled", "budget_tokens": 10000},
+        "temperature": 1.0
+    });
 
-    // Simulate what convert_anthropic_request does
-    let req = AnthropicRequest {
-        model: "test-model".into(),
-        messages: vec![json!({"role": "user", "content": "hi"})],
-        max_tokens: 1024,
-        stream: Some(true),
-        system: Some(system_blocks.clone()),
-        tools: None,
-        temperature: None,
-        thinking: None,
-    };
+    let cr = convert_raw_to_completion_request(raw.clone());
+    assert_eq!(cr.model, "claude-sonnet-4-5-20250514");
+    assert_eq!(cr.system_prompt.as_deref(), Some("You are a helpful assistant.\n\nAdditional context."));
 
-    let cr = convert_anthropic_request(req);
-
-    // Verify _anthropic_system is set
-    let raw = cr.extra_params.get("_anthropic_system").unwrap();
-    assert_eq!(raw[0]["cache_control"]["type"], "ephemeral");
-    assert_eq!(raw[1]["cache_control"]["ttl"], "1h");
-
-    // Now verify build_request_body uses the raw blocks
+    // Build the request body the Anthropic backend would send
     let body = build_request_body_for_test(&cr, false).unwrap();
+
+    // Every field from the original request must be preserved
+    assert_eq!(body["model"], "claude-sonnet-4-5-20250514");
+    assert_eq!(body["max_tokens"], 16384);
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["temperature"], 1.0);
+
+    // System blocks with cache_control intact
     let system = body["system"].as_array().unwrap();
     assert_eq!(system.len(), 2);
-    assert_eq!(system[0]["text"], "You are a helpful assistant.");
     assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
-    assert_eq!(system[1]["text"], "Additional context here.");
     assert_eq!(system[1]["cache_control"]["ttl"], "1h");
+
+    // Tools with INDIVIDUAL cache_control (the old handler dropped these)
+    let tools = body["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+
+    // Fields the old handler dropped entirely
+    assert_eq!(body["tool_choice"]["type"], "auto");
+    assert_eq!(body["metadata"]["user_id"], "test-user");
+    assert_eq!(body["thinking"]["type"], "enabled");
+    assert_eq!(body["thinking"]["budget_tokens"], 10000);
 }
 
 #[test]
-fn system_without_anthropic_passthrough_still_works() {
+fn raw_passthrough_updates_model_for_fallback() {
     use crate::backends::anthropic::build_request_body_for_test;
 
-    // Regular request (not from anthropic proxy) — no _anthropic_system
+    let raw = json!({
+        "model": "claude-sonnet-4-5-20250514",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1024,
+        "stream": true,
+    });
+
+    let mut cr = convert_raw_to_completion_request(raw);
+    // Router fallback changes the model
+    cr.model = "claude-haiku-4-5-20250514".to_string();
+
+    let body = build_request_body_for_test(&cr, false).unwrap();
+    assert_eq!(body["model"], "claude-haiku-4-5-20250514");
+    assert_eq!(body["stream"], true);
+}
+
+#[test]
+fn non_proxy_request_still_reconstructs() {
+    use crate::backends::anthropic::build_request_body_for_test;
+
+    // Regular request (not from proxy) — no _anthropic_raw_body
     let cr = CompletionRequest {
         model: "test-model".into(),
         messages: vec![json!({"role": "user", "content": "hi"})],
@@ -641,6 +705,49 @@ fn system_without_anthropic_passthrough_still_works() {
     let system = body["system"].as_array().unwrap();
     assert_eq!(system.len(), 1);
     assert_eq!(system[0]["text"], "Be helpful");
-    // Should have cache_control added by the backend
     assert!(system[0].get("cache_control").is_some());
+}
+
+// ── 5.6 Legacy typed conversion tests (convert_anthropic_request) ─────
+
+#[test]
+fn system_cache_control_round_trip_via_typed_path() {
+    use crate::backends::anthropic::build_request_body_for_test;
+
+    let system_blocks = vec![
+        json!({
+            "type": "text",
+            "text": "You are a helpful assistant.",
+            "cache_control": {"type": "ephemeral"}
+        }),
+        json!({
+            "type": "text",
+            "text": "Additional context here.",
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+        }),
+    ];
+
+    let req = AnthropicRequest {
+        model: "test-model".into(),
+        messages: vec![json!({"role": "user", "content": "hi"})],
+        max_tokens: 1024,
+        stream: Some(true),
+        system: Some(system_blocks.clone()),
+        tools: None,
+        temperature: None,
+        thinking: None,
+    };
+
+    let cr = convert_anthropic_request(req);
+
+    let raw = cr.extra_params.get("_anthropic_system").unwrap();
+    assert_eq!(raw[0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(raw[1]["cache_control"]["ttl"], "1h");
+
+    let body = build_request_body_for_test(&cr, false).unwrap();
+    let system = body["system"].as_array().unwrap();
+    assert_eq!(system.len(), 2);
+    assert_eq!(system[0]["text"], "You are a helpful assistant.");
+    assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(system[1]["cache_control"]["ttl"], "1h");
 }
