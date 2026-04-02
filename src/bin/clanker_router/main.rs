@@ -349,7 +349,7 @@ fn build_providers(cli: &Cli, auth_store: &AuthStore) -> Vec<Arc<dyn Provider>> 
             } else {
                 // Single account: legacy path
                 let cred = &creds[0].1;
-                let anthropic_cred = if cred.is_oauth() {
+                let anthropic_cred = if cred.is_oauth() || clanker_router::auth::is_oauth_token(cred.token()) {
                     Credential::OAuth(cred.token().to_string())
                 } else {
                     Credential::ApiKey(cred.token().to_string())
@@ -745,10 +745,27 @@ async fn run_auth(auth_path: &PathBuf, action: &AuthAction) {
             }
 
             let mut store = AuthStore::load(auth_path);
-            store.set_credential(provider, account, StoredCredential::ApiKey {
-                api_key,
-                label: label.clone(),
-            });
+
+            // Auto-detect OAuth access tokens (e.g. from `claude setup-token`).
+            // These need Bearer auth, not x-api-key, so store them as OAuth
+            // credentials with a far-future expiry and no refresh token.
+            let credential = if clanker_router::auth::is_oauth_token(&api_key) {
+                let one_year_ms = chrono::Utc::now().timestamp_millis() + 365 * 24 * 3600 * 1000;
+                println!("Detected OAuth access token — storing as OAuth credential");
+                StoredCredential::OAuth {
+                    access_token: api_key,
+                    refresh_token: String::new(),
+                    expires_at_ms: one_year_ms,
+                    label: label.clone(),
+                }
+            } else {
+                StoredCredential::ApiKey {
+                    api_key,
+                    label: label.clone(),
+                }
+            };
+
+            store.set_credential(provider, account, credential);
             store.save(auth_path).expect("failed to save auth store");
             println!("Saved {} key for account '{}' in {}", provider, account, auth_path.display());
         }
