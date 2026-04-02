@@ -3,6 +3,7 @@
 //! Standalone binary for managing LLM provider routing, credentials,
 //! model discovery, and interactive chat.
 
+mod credential_refresh;
 mod tui;
 
 use std::path::PathBuf;
@@ -1181,6 +1182,37 @@ async fn run_serve(cli: &Cli, auth_store: &AuthStore, daemon: bool, proxy_addr: 
     // Start background cache eviction (if DB + cache are enabled)
     let _eviction_handle = router.start_cache_eviction();
 
+    // Start background OAuth token refresh (if Anthropic OAuth is configured)
+    let refresh_cancel = tokio_util::sync::CancellationToken::new();
+    let _refresh_handle = {
+        let has_oauth = auth_store
+            .active_credential("anthropic")
+            .is_some_and(|c| c.is_oauth());
+        if has_oauth {
+            let auth_path = resolve_auth_path(cli);
+            let router_clone = Arc::clone(&router);
+            let update_fn: credential_refresh::CredentialUpdateFn = Arc::new(move |new_token| {
+                let r = Arc::clone(&router_clone);
+                Box::pin(async move {
+                    // Reload all provider credentials — the Anthropic provider
+                    // will pick up the new token from the auth store on next request.
+                    // For immediate effect, we also trigger Provider::reload_credentials.
+                    r.reload_credentials().await;
+                    tracing::debug!("Router credentials reloaded after OAuth refresh");
+                    let _ = new_token; // token already persisted to auth store
+                })
+            });
+            let refresher = credential_refresh::CredentialRefresher::new(
+                auth_path,
+                update_fn,
+                refresh_cancel.clone(),
+            );
+            Some(tokio::spawn(refresher.run()))
+        } else {
+            None
+        }
+    };
+
     // Parse proxy bind address
     let bind_addr: std::net::SocketAddr = match proxy_addr.parse() {
         Ok(a) => a,
@@ -1303,7 +1335,8 @@ async fn run_serve(cli: &Cli, auth_store: &AuthStore, daemon: bool, proxy_addr: 
         }
     }
 
-    // Graceful shutdown of iroh router
+    // Graceful shutdown
+    refresh_cancel.cancel();
     iroh_router.shutdown().await.ok();
     DaemonInfo::remove(&info_path);
 }
