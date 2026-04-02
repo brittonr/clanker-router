@@ -55,6 +55,11 @@ pub struct AnthropicProvider {
     pool: Option<CredentialPool>,
     models: Vec<Model>,
     retry: RetryConfig,
+    /// Optional notify handle for reactive credential refresh on 401.
+    /// When set and a 401 is received with an OAuth credential, the provider
+    /// notifies the refresher, waits briefly, re-reads `self.credential`,
+    /// and retries once.
+    refresh_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Credential for the Anthropic API.
@@ -90,6 +95,7 @@ impl AnthropicProvider {
             pool: None,
             models: default_models(),
             retry: RetryConfig::default(),
+            refresh_notify: None,
         })
     }
 
@@ -107,12 +113,22 @@ impl AnthropicProvider {
             pool: Some(pool),
             models: default_models(),
             retry: RetryConfig::default(),
+            refresh_notify: None,
         })
     }
 
     /// Update the credential (e.g. after OAuth refresh).
     pub async fn update_credential(&self, cred: Credential) {
         *self.credential.write().await = cred;
+    }
+
+    /// Set a notify handle for reactive credential refresh on 401.
+    ///
+    /// When a 401 is received with an OAuth credential, the provider notifies
+    /// the handle (waking the background refresh loop), waits briefly, re-reads
+    /// the in-memory credential, and retries once.
+    pub fn set_refresh_notify(&mut self, notify: Arc<tokio::sync::Notify>) {
+        self.refresh_notify = Some(notify);
     }
 
     /// Get a reference to the credential pool, if configured.
@@ -232,8 +248,11 @@ impl AnthropicProvider {
         let url = format!("{}/v1/messages", self.base_url);
 
         let mut attempt = 0;
+        let mut active_cred = cred.clone();
+        let mut did_reactive_refresh = false;
         loop {
             attempt += 1;
+            let cred = &active_cred;
 
             let mut builder = self
                 .client
@@ -283,6 +302,22 @@ impl AnthropicProvider {
                 .and_then(crate::retry::parse_retry_after);
 
             let body_text = resp.text().await.unwrap_or_default();
+
+            // Reactive OAuth refresh on 401: notify the background refresher,
+            // wait briefly for it to update the credential, then retry once.
+            if status_code == 401
+                && cred.is_oauth()
+                && !did_reactive_refresh
+                && let Some(ref notify) = self.refresh_notify
+            {
+                warn!("Anthropic 401 with OAuth token — triggering reactive refresh");
+                notify.notify_one();
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                active_cred = self.credential.read().await.clone();
+                did_reactive_refresh = true;
+                attempt -= 1; // don't count the 401 as a retry attempt
+                continue;
+            }
 
             if is_retryable_status(status_code) && attempt <= self.retry.max_retries {
                 let delay = retry_after.unwrap_or_else(|| self.retry.backoff_for(attempt));
