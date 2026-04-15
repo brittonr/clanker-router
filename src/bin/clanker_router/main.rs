@@ -428,15 +428,20 @@ async fn build_providers(cli: &Cli, auth_store: &AuthStore, auth_paths: &AuthSto
                 .get(openai_codex::OPENAI_CODEX_PROVIDER)
                 .and_then(|provider| provider.active_account.clone())
                 .unwrap_or_else(|| "default".to_string());
-            let models = openai_codex::catalog_for_active_account(auth_store, &account).await;
+            let manager = CredentialManager::with_refresh_fn(
+                openai_codex::OPENAI_CODEX_PROVIDER.to_string(),
+                credential,
+                auth_paths.clone(),
+                None,
+                openai_codex::refresh_fn_for_codex(),
+            );
+            let models = openai_codex::catalog_for_active_account_with_manager(
+                auth_store,
+                &account,
+                Some(manager.as_ref()),
+            )
+            .await;
             if !models.is_empty() {
-                let manager = CredentialManager::with_refresh_fn(
-                    openai_codex::OPENAI_CODEX_PROVIDER.to_string(),
-                    credential,
-                    auth_paths.clone(),
-                    None,
-                    openai_codex::refresh_fn_for_codex(),
-                );
                 providers.push(OpenAICodexProvider::new(manager, models, account));
             }
         }
@@ -799,7 +804,11 @@ fn describe_credential(cred: &StoredCredential) -> String {
     }
 }
 
-async fn provider_status_lines(effective: &clanker_router::auth::EffectiveAuthStore, provider: &str) -> Vec<String> {
+async fn provider_status_lines(
+    effective: &clanker_router::auth::EffectiveAuthStore,
+    auth_paths: &AuthStorePaths,
+    provider: &str,
+) -> Vec<String> {
     let mut infos = effective.list_accounts_with_sources(provider);
     infos.sort_by(|a, b| b.info.is_active.cmp(&a.info.is_active).then_with(|| a.info.name.cmp(&b.info.name)));
 
@@ -818,7 +827,26 @@ async fn provider_status_lines(effective: &clanker_router::auth::EffectiveAuthSt
             .map(describe_credential)
             .unwrap_or_else(|| "unknown".to_string());
         let detail = if provider == openai_codex::OPENAI_CODEX_PROVIDER {
-            match openai_codex::codex_status_suffix(effective.store(), &sourced.info.name).await {
+            let manager = effective
+                .store()
+                .credential_for(provider, &sourced.info.name)
+                .cloned()
+                .map(|credential| {
+                    CredentialManager::with_refresh_fn(
+                        provider.to_string(),
+                        credential,
+                        auth_paths.clone(),
+                        None,
+                        openai_codex::refresh_fn_for_codex(),
+                    )
+                });
+            match openai_codex::codex_status_suffix_with_manager(
+                effective.store(),
+                &sourced.info.name,
+                manager.as_deref(),
+            )
+            .await
+            {
                 Some(suffix) => format!("{}; {}", base, suffix),
                 None => base,
             }
@@ -897,7 +925,7 @@ async fn run_auth(auth_paths: &AuthStorePaths, action: &AuthAction) {
                         println!();
                     }
                     println!("{}:", provider_name);
-                    for line in provider_status_lines(&effective, provider_name).await {
+                    for line in provider_status_lines(&effective, auth_paths, provider_name).await {
                         println!("{}", line);
                     }
                 }
@@ -1035,7 +1063,7 @@ async fn run_auth(auth_paths: &AuthStorePaths, action: &AuthAction) {
                     println!();
                 }
                 println!("{}:", provider_name);
-                for line in provider_status_lines(&effective, provider_name).await {
+                for line in provider_status_lines(&effective, auth_paths, provider_name).await {
                     println!("{}", line);
                 }
             }

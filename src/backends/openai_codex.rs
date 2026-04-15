@@ -32,14 +32,14 @@ pub const OPENAI_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/co
 const OPENAI_CODEX_BETA_HEADER: &str = "responses=experimental";
 const OPENAI_CODEX_NOT_ENTITLED_CODE: &str = "usage_not_included";
 
-pub const OPENAI_CODEX_MODEL_IDS: [&str; 6] = [
-    "gpt-5.1-codex",
-    "gpt-5.1-codex-max",
-    "gpt-5.1-codex-mini",
-    "gpt-5.2-codex",
+pub const OPENAI_CODEX_MODEL_IDS: [&str; 5] = [
+    "gpt-5.4",
+    "gpt-5.4-mini",
     "gpt-5.3-codex",
     "gpt-5.3-codex-spark",
+    "gpt-5.2",
 ];
+const OPENAI_CODEX_PROBE_MODEL: &str = "gpt-5.4";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntitlementState {
@@ -164,9 +164,9 @@ async fn send_probe_request(credential: &StoredCredential) -> Result<reqwest::Re
     let token = credential.token().to_string();
     let account_id = openai_codex_account_id_from_credential(credential)?;
     let body = json!({
-        "model": "gpt-5.1-codex-mini",
+        "model": OPENAI_CODEX_PROBE_MODEL,
         "store": false,
-        "stream": false,
+        "stream": true,
         "instructions": "codex entitlement probe",
         "input": [{
             "role": "user",
@@ -258,15 +258,30 @@ pub async fn ensure_entitlement(
         EntitlementState::Unknown => {}
     }
 
-    let Some(credential) = store.credential_for(OPENAI_CODEX_PROVIDER, account) else {
+    let Some(mut credential) = store.credential_for(OPENAI_CODEX_PROVIDER, account).cloned() else {
         return cached;
     };
     if credential.is_expired() {
-        return cached;
+        if let Some(manager) = manager {
+            match manager.get_credential().await {
+                Ok(refreshed) => credential = refreshed,
+                Err(e) => {
+                    return set_entitlement_record(
+                        account,
+                        EntitlementRecord {
+                            state: EntitlementState::Unknown,
+                            last_error: Some(e.to_string()),
+                        },
+                    );
+                }
+            }
+        } else {
+            return cached;
+        }
     }
 
     let checked_at_ms = now_ms();
-    match run_probe(credential, manager).await {
+    match run_probe(&credential, manager).await {
         ProbeOutcome::Entitled => set_entitlement_record(
             account,
             EntitlementRecord {
@@ -292,12 +307,17 @@ pub async fn ensure_entitlement(
 }
 
 pub async fn codex_status_suffix(store: &AuthStore, account: &str) -> Option<String> {
-    let credential = store.credential_for(OPENAI_CODEX_PROVIDER, account)?;
-    if credential.is_expired() {
-        return None;
-    }
+    codex_status_suffix_with_manager(store, account, None).await
+}
 
-    let record = ensure_entitlement(store, account, None).await;
+pub async fn codex_status_suffix_with_manager(
+    store: &AuthStore,
+    account: &str,
+    manager: Option<&CredentialManager>,
+) -> Option<String> {
+    store.credential_for(OPENAI_CODEX_PROVIDER, account)?;
+
+    let record = ensure_entitlement(store, account, manager).await;
     Some(match record.state {
         EntitlementState::Entitled { .. } => "codex entitled".to_string(),
         EntitlementState::NotEntitled { .. } => "authenticated but not entitled for Codex use".to_string(),
@@ -312,7 +332,15 @@ pub async fn codex_status_suffix(store: &AuthStore, account: &str) -> Option<Str
 }
 
 pub async fn catalog_for_active_account(store: &AuthStore, account: &str) -> Vec<Model> {
-    match ensure_entitlement(store, account, None).await.state {
+    catalog_for_active_account_with_manager(store, account, None).await
+}
+
+pub async fn catalog_for_active_account_with_manager(
+    store: &AuthStore,
+    account: &str,
+    manager: Option<&CredentialManager>,
+) -> Vec<Model> {
+    match ensure_entitlement(store, account, manager).await.state {
         EntitlementState::Entitled { .. } => codex_models(),
         EntitlementState::Unknown | EntitlementState::NotEntitled { .. } => Vec::new(),
     }
@@ -1284,15 +1312,14 @@ mod tests {
     fn codex_catalog_is_exact_fixed_set() {
         let ids: Vec<&str> = OPENAI_CODEX_MODEL_IDS.to_vec();
         let unique: HashSet<&str> = ids.iter().copied().collect();
-        assert_eq!(ids.len(), 6);
-        assert_eq!(unique.len(), 6);
+        assert_eq!(ids.len(), 5);
+        assert_eq!(unique.len(), 5);
         assert_eq!(ids, vec![
-            "gpt-5.1-codex",
-            "gpt-5.1-codex-max",
-            "gpt-5.1-codex-mini",
-            "gpt-5.2-codex",
+            "gpt-5.4",
+            "gpt-5.4-mini",
             "gpt-5.3-codex",
             "gpt-5.3-codex-spark",
+            "gpt-5.2",
         ]);
     }
 
@@ -1366,7 +1393,7 @@ mod tests {
     #[test]
     fn build_codex_request_body_preserves_session_cache_and_tools() {
         let request = CompletionRequest {
-            model: "gpt-5.1-codex".to_string(),
+            model: "gpt-5.4".to_string(),
             messages: vec![json!({"role": "user", "content": [{"type": "text", "text": "hello"}]})],
             system_prompt: Some("system".to_string()),
             max_tokens: Some(128),
