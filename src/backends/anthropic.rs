@@ -25,7 +25,9 @@ use tracing::info;
 use tracing::warn;
 
 use super::common;
+use crate::auth::AuthStorePaths;
 use crate::credential_pool::CredentialPool;
+use crate::credential_pool::SelectionStrategy;
 use crate::error::Error;
 use crate::error::Result;
 use crate::model::Model;
@@ -52,7 +54,9 @@ pub struct AnthropicProvider {
     /// Legacy single-credential field (used when pool is None)
     credential: RwLock<Credential>,
     /// Multi-credential pool (preferred when present)
-    pool: Option<CredentialPool>,
+    pool: RwLock<Option<Arc<CredentialPool>>>,
+    /// Managed auth-store paths for service reloads.
+    auth_paths: Option<AuthStorePaths>,
     models: Vec<Model>,
     retry: RetryConfig,
     /// Optional notify handle for reactive credential refresh on 401.
@@ -84,6 +88,14 @@ impl Credential {
     }
 }
 
+fn to_provider_credential(credential: &crate::auth::StoredCredential) -> Credential {
+    if credential.is_oauth() || crate::auth::is_oauth_token(credential.token()) {
+        Credential::OAuth(credential.token().to_string())
+    } else {
+        Credential::ApiKey(credential.token().to_string())
+    }
+}
+
 impl AnthropicProvider {
     /// Create a provider with a single credential (backwards compatible).
     #[allow(clippy::new_ret_no_self)]
@@ -92,7 +104,8 @@ impl AnthropicProvider {
             client: common::build_http_client(Duration::from_secs(300)).expect("Failed to build HTTP client"),
             base_url: base_url.unwrap_or_else(|| BASE_URL.to_string()),
             credential: RwLock::new(credential),
-            pool: None,
+            pool: RwLock::new(None),
+            auth_paths: None,
             models: default_models(),
             retry: RetryConfig::default(),
             refresh_notify: None,
@@ -110,7 +123,38 @@ impl AnthropicProvider {
             client: common::build_http_client(Duration::from_secs(300)).expect("Failed to build HTTP client"),
             base_url: base_url.unwrap_or_else(|| BASE_URL.to_string()),
             credential: RwLock::new(fallback),
-            pool: Some(pool),
+            pool: RwLock::new(Some(Arc::new(pool))),
+            auth_paths: None,
+            models: default_models(),
+            retry: RetryConfig::default(),
+            refresh_notify: None,
+        })
+    }
+
+    /// Create a provider with a single credential and managed auth-store reloads.
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new_managed(credential: Credential, base_url: Option<String>, auth_paths: AuthStorePaths) -> Arc<dyn Provider> {
+        Arc::new(Self {
+            client: common::build_http_client(Duration::from_secs(300)).expect("Failed to build HTTP client"),
+            base_url: base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            credential: RwLock::new(credential),
+            pool: RwLock::new(None),
+            auth_paths: Some(auth_paths),
+            models: default_models(),
+            retry: RetryConfig::default(),
+            refresh_notify: None,
+        })
+    }
+
+    /// Create a pooled provider with managed auth-store reloads.
+    pub fn with_pool_managed(pool: CredentialPool, base_url: Option<String>, auth_paths: AuthStorePaths) -> Arc<dyn Provider> {
+        let fallback = Credential::ApiKey(String::new());
+        Arc::new(Self {
+            client: common::build_http_client(Duration::from_secs(300)).expect("Failed to build HTTP client"),
+            base_url: base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            credential: RwLock::new(fallback),
+            pool: RwLock::new(Some(Arc::new(pool))),
+            auth_paths: Some(auth_paths),
             models: default_models(),
             retry: RetryConfig::default(),
             refresh_notify: None,
@@ -131,9 +175,9 @@ impl AnthropicProvider {
         self.refresh_notify = Some(notify);
     }
 
-    /// Get a reference to the credential pool, if configured.
-    pub fn pool(&self) -> Option<&CredentialPool> {
-        self.pool.as_ref()
+    /// Get the credential pool, if configured.
+    pub async fn pool(&self) -> Option<Arc<CredentialPool>> {
+        self.pool.read().await.clone()
     }
 }
 
@@ -142,8 +186,8 @@ impl Provider for AnthropicProvider {
     async fn complete(&self, request: CompletionRequest, tx: mpsc::Sender<StreamEvent>) -> Result<()> {
         // If we have a credential pool, use pool-aware dispatch with auto-rotation.
         // Otherwise, fall back to single-credential path.
-        if let Some(ref pool) = self.pool {
-            return self.complete_with_pool(pool, request, tx).await;
+        if let Some(pool) = self.pool.read().await.clone() {
+            return self.complete_with_pool(&pool, request, tx).await;
         }
 
         let is_oauth = self.credential.read().await.is_oauth();
@@ -163,7 +207,7 @@ impl Provider for AnthropicProvider {
 
     async fn is_available(&self) -> bool {
         // If we have a pool, check if any credential is available
-        if let Some(ref pool) = self.pool {
+        if let Some(pool) = self.pool.read().await.clone() {
             return pool.select().await.is_some();
         }
 
@@ -172,6 +216,26 @@ impl Provider for AnthropicProvider {
             Credential::ApiKey(key) => !key.is_empty(),
             Credential::OAuth(token) => !token.is_empty(),
         }
+    }
+
+    async fn reload_credentials(&self) {
+        let Some(auth_paths) = &self.auth_paths else {
+            return;
+        };
+
+        let store = auth_paths.load_effective().into_store();
+        let all_creds = store.all_credentials("anthropic");
+        if all_creds.len() > 1 {
+            *self.pool.write().await = Some(Arc::new(CredentialPool::new(all_creds, SelectionStrategy::Failover)));
+            return;
+        }
+
+        *self.pool.write().await = None;
+        let updated = store
+            .active_credential("anthropic")
+            .map(to_provider_credential)
+            .unwrap_or_else(|| Credential::ApiKey(String::new()));
+        *self.credential.write().await = updated;
     }
 }
 

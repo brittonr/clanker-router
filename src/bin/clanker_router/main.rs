@@ -3,24 +3,31 @@
 //! Standalone binary for managing LLM provider routing, credentials,
 //! model discovery, and interactive chat.
 
-mod credential_refresh;
 mod tui;
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clanker_router::Router;
 use clanker_router::auth::AuthStore;
+use clanker_router::auth::AuthStorePaths;
+use clanker_router::auth::ImportTarget;
+use clanker_router::auth::OAuthFlow;
+use clanker_router::auth::PendingOAuthLogin;
 use clanker_router::auth::StoredCredential;
+use clanker_router::auth::pending_oauth_login_path;
 use clanker_router::auth::env_var_for_provider;
 use clanker_router::auth::resolve_credential;
 use clanker_router::backends::huggingface::HubClient;
+use clanker_router::backends::openai_codex;
+use clanker_router::backends::openai_codex::OpenAICodexProvider;
 use clanker_router::backends::openai_compat::OpenAICompatConfig;
 use clanker_router::backends::openai_compat::OpenAICompatProvider;
+use clanker_router::credential::CredentialManager;
 use clanker_router::credential_pool::CredentialPool;
 use clanker_router::credential_pool::SelectionStrategy;
 use clanker_router::model::ModelAliases;
-use clanker_router::oauth;
 use clanker_router::provider::CompletionRequest;
 use clanker_router::provider::Provider;
 use clanker_router::streaming::ContentDelta;
@@ -55,9 +62,17 @@ struct Cli {
     #[arg(long)]
     api_base: Option<String>,
 
-    /// Auth store path
+    /// Auth store path (single-file mode)
     #[arg(long)]
     auth_file: Option<PathBuf>,
+
+    /// Read-only seed auth store path (managed service mode)
+    #[arg(long)]
+    auth_seed_file: Option<PathBuf>,
+
+    /// Writable runtime auth store path (managed service mode)
+    #[arg(long)]
+    auth_runtime_file: Option<PathBuf>,
 
     /// Enable verbose logging
     #[arg(short, long)]
@@ -146,16 +161,43 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum AuthAction {
-    /// Show credential status for all providers
-    Status,
-    /// Log in to Anthropic via OAuth (Claude Max)
+    /// Show credential status
+    Status {
+        /// Provider name (shows all if omitted)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Show all configured providers
+        #[arg(long)]
+        all: bool,
+    },
+    /// Authenticate with an OAuth provider
     Login {
+        /// Provider name (`anthropic`, `openai-codex`)
+        #[arg(long)]
+        provider: Option<String>,
         /// Account name
         #[arg(long, default_value = "default")]
         account: String,
         /// Complete login with code from browser (code#state or callback URL)
         #[arg(long)]
         code: Option<String>,
+    },
+    /// Export one provider/account record as JSON
+    Export {
+        /// Provider name
+        provider: String,
+        /// Account name
+        #[arg(long, default_value = "default")]
+        account: String,
+    },
+    /// Import one provider/account record from JSON
+    Import {
+        /// Path to JSON record (`-` for stdin)
+        #[arg(long, default_value = "-")]
+        input: String,
+        /// Write target (`auto`, `file`, `seed`, `runtime`)
+        #[arg(long, default_value = "auto")]
+        target: String,
     },
     /// Set an API key for a provider
     SetKey {
@@ -266,9 +308,27 @@ fn resolve_auth_path(cli: &Cli) -> PathBuf {
     cli.auth_file.clone().unwrap_or_else(default_auth_path)
 }
 
+fn resolve_auth_paths(cli: &Cli) -> AuthStorePaths {
+    if cli.auth_seed_file.is_some() || cli.auth_runtime_file.is_some() {
+        AuthStorePaths {
+            auth_file: None,
+            seed_file: cli.auth_seed_file.clone(),
+            runtime_file: cli.auth_runtime_file.clone(),
+        }
+    } else {
+        AuthStorePaths::single(resolve_auth_path(cli))
+    }
+}
+
+fn auth_base_dir(auth_paths: &AuthStorePaths) -> PathBuf {
+    auth_paths
+        .pending_oauth_base_dir()
+        .unwrap_or_else(|| default_auth_path().parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")))
+}
+
 // ── Provider construction ───────────────────────────────────────────────
 
-fn build_providers(cli: &Cli, auth_store: &AuthStore) -> Vec<Arc<dyn Provider>> {
+async fn build_providers(cli: &Cli, auth_store: &AuthStore, auth_paths: &AuthStorePaths) -> Vec<Arc<dyn Provider>> {
     let mut providers: Vec<Arc<dyn Provider>> = Vec::new();
 
     // ── Helpers ──────────────────────────────────────────────────────
@@ -345,7 +405,7 @@ fn build_providers(cli: &Cli, auth_store: &AuthStore) -> Vec<Arc<dyn Provider>> 
                 // Multi-account: build a credential pool
                 let pool = CredentialPool::new(creds, SelectionStrategy::Failover);
                 tracing::info!("anthropic: {} account(s) in pool", pool.len());
-                providers.push(AnthropicProvider::with_pool(pool, base_url));
+                providers.push(AnthropicProvider::with_pool_managed(pool, base_url, auth_paths.clone()));
             } else {
                 // Single account: legacy path
                 let cred = &creds[0].1;
@@ -354,7 +414,30 @@ fn build_providers(cli: &Cli, auth_store: &AuthStore) -> Vec<Arc<dyn Provider>> 
                 } else {
                     Credential::ApiKey(cred.token().to_string())
                 };
-                providers.push(AnthropicProvider::new(anthropic_cred, base_url));
+                providers.push(AnthropicProvider::new_managed(anthropic_cred, base_url, auth_paths.clone()));
+            }
+        }
+    }
+
+    // ── OpenAI Codex ────────────────────────────────────────────────
+
+    {
+        if let Some(credential) = auth_store.active_credential(openai_codex::OPENAI_CODEX_PROVIDER).cloned() {
+            let account = auth_store
+                .providers
+                .get(openai_codex::OPENAI_CODEX_PROVIDER)
+                .and_then(|provider| provider.active_account.clone())
+                .unwrap_or_else(|| "default".to_string());
+            let models = openai_codex::catalog_for_active_account(auth_store, &account).await;
+            if !models.is_empty() {
+                let manager = CredentialManager::with_refresh_fn(
+                    openai_codex::OPENAI_CODEX_PROVIDER.to_string(),
+                    credential,
+                    auth_paths.clone(),
+                    None,
+                    openai_codex::refresh_fn_for_codex(),
+                );
+                providers.push(OpenAICodexProvider::new(manager, models, account));
             }
         }
     }
@@ -456,7 +539,7 @@ fn default_db_path() -> PathBuf {
     dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("clanker-router").join("router.db")
 }
 
-fn build_router(cli: &Cli, auth_store: &AuthStore) -> Router {
+async fn build_router(cli: &Cli, auth_store: &AuthStore, auth_paths: &AuthStorePaths) -> Router {
     let db_path = default_db_path();
     let mut router = match clanker_router::RouterDb::open(&db_path) {
         Ok(db) => {
@@ -468,7 +551,7 @@ fn build_router(cli: &Cli, auth_store: &AuthStore) -> Router {
             Router::new(&cli.model)
         }
     };
-    for provider in build_providers(cli, auth_store) {
+    for provider in build_providers(cli, auth_store, auth_paths).await {
         router.register_provider(provider);
     }
 
@@ -501,8 +584,13 @@ async fn main() {
             .init();
     }
 
-    let auth_path = resolve_auth_path(&cli);
-    let auth_store = AuthStore::load(&auth_path);
+    if cli.auth_file.is_some() && (cli.auth_seed_file.is_some() || cli.auth_runtime_file.is_some()) {
+        eprintln!("Use either --auth-file or --auth-seed-file/--auth-runtime-file, not both.");
+        std::process::exit(1);
+    }
+
+    let auth_paths = resolve_auth_paths(&cli);
+    let auth_store = auth_paths.load_effective().into_store();
 
     match &cli.command {
         None | Some(Commands::Chat { .. }) => {
@@ -510,7 +598,7 @@ async fn main() {
                 Some(Commands::Chat { system }) => system.clone(),
                 _ => None,
             };
-            run_tui(&cli, &auth_store, system).await;
+            run_tui(&cli, &auth_store, &auth_paths, system).await;
         }
         Some(Commands::Ask {
             prompt,
@@ -519,32 +607,32 @@ async fn main() {
             temperature,
             format,
         }) => {
-            run_ask(&cli, &auth_store, prompt, system.clone(), *max_tokens, *temperature, format).await;
+            run_ask(&cli, &auth_store, &auth_paths, prompt, system.clone(), *max_tokens, *temperature, format).await;
         }
         Some(Commands::Models { provider, json }) => {
-            run_models(&cli, &auth_store, provider.as_deref(), *json);
+            run_models(&cli, &auth_store, &auth_paths, provider.as_deref(), *json).await;
         }
         Some(Commands::Auth { action }) => {
-            run_auth(&auth_path, action).await;
+            run_auth(&auth_paths, action).await;
         }
         Some(Commands::Resolve { name }) => {
-            run_resolve(&cli, &auth_store, name);
+            run_resolve(&cli, &auth_store, &auth_paths, name).await;
         }
         Some(Commands::Status) => {
-            run_status(&cli, &auth_store);
+            run_status(&cli, &auth_store, &auth_paths).await;
         }
         Some(Commands::Usage { days, total, json }) => {
             run_usage(*days, *total, *json);
         }
         Some(Commands::Hf { action }) => {
-            run_hf(&cli, &auth_store, action).await;
+            run_hf(&cli, &auth_store, &auth_paths, action).await;
         }
         Some(Commands::Serve {
             daemon,
             proxy_addr,
             proxy_key,
         }) => {
-            run_serve(&cli, &auth_store, *daemon, proxy_addr, proxy_key).await;
+            run_serve(&cli, &auth_store, &auth_paths, *daemon, proxy_addr, proxy_key).await;
         }
     }
 }
@@ -554,13 +642,14 @@ async fn main() {
 async fn run_ask(
     cli: &Cli,
     auth_store: &AuthStore,
+    auth_paths: &AuthStorePaths,
     prompt: &str,
     system: Option<String>,
     max_tokens: Option<usize>,
     temperature: Option<f64>,
     format: &OutputFormat,
 ) {
-    let router = build_router(cli, auth_store);
+    let router = build_router(cli, auth_store, auth_paths).await;
 
     if router.provider_names().is_empty() {
         eprintln!("Error: No providers configured. Set an API key:");
@@ -644,8 +733,8 @@ async fn run_ask(
 
 // ── Models ──────────────────────────────────────────────────────────────
 
-fn run_models(cli: &Cli, auth_store: &AuthStore, provider_filter: Option<&str>, json: bool) {
-    let router = build_router(cli, auth_store);
+async fn run_models(cli: &Cli, auth_store: &AuthStore, auth_paths: &AuthStorePaths, provider_filter: Option<&str>, json: bool) {
+    let router = build_router(cli, auth_store, auth_paths).await;
     let models = if let Some(prov) = provider_filter {
         router.registry().list_for_provider(prov).into_iter().cloned().collect::<Vec<_>>()
     } else {
@@ -684,18 +773,106 @@ fn run_models(cli: &Cli, auth_store: &AuthStore, provider_filter: Option<&str>, 
 
 // ── Auth ────────────────────────────────────────────────────────────────
 
-async fn run_auth(auth_path: &PathBuf, action: &AuthAction) {
-    match action {
-        AuthAction::Login { account, code } => {
-            run_auth_login(auth_path, account, code.as_deref()).await;
+fn format_expires_in(expires_at_ms: i64) -> String {
+    let remaining_ms = expires_at_ms - chrono::Utc::now().timestamp_millis();
+    if remaining_ms <= 0 {
+        return "expired".to_string();
+    }
+    let mins = remaining_ms / 60_000;
+    if mins > 60 {
+        format!("{}h {}m", mins / 60, mins % 60)
+    } else {
+        format!("{}m", mins)
+    }
+}
+
+fn describe_credential(cred: &StoredCredential) -> String {
+    match cred {
+        StoredCredential::ApiKey { .. } => "api key".to_string(),
+        StoredCredential::OAuth { expires_at_ms, .. } => {
+            if cred.is_expired() {
+                "oauth expired".to_string()
+            } else {
+                format!("oauth valid (expires in {})", format_expires_in(*expires_at_ms))
+            }
         }
-        AuthAction::Status => {
-            let store = AuthStore::load(auth_path);
-            let summary = store.summary();
-            if summary.contains("No credentials") {
-                println!("{}", summary);
+    }
+}
+
+async fn provider_status_lines(effective: &clanker_router::auth::EffectiveAuthStore, provider: &str) -> Vec<String> {
+    let mut infos = effective.list_accounts_with_sources(provider);
+    infos.sort_by(|a, b| b.info.is_active.cmp(&a.info.is_active).then_with(|| a.info.name.cmp(&b.info.name)));
+
+    let mut lines = Vec::new();
+    for sourced in infos {
+        let marker = if sourced.info.is_active { "▸" } else { " " };
+        let label = sourced
+            .info
+            .label
+            .as_ref()
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default();
+        let base = effective
+            .store()
+            .credential_for(provider, &sourced.info.name)
+            .map(describe_credential)
+            .unwrap_or_else(|| "unknown".to_string());
+        let detail = if provider == openai_codex::OPENAI_CODEX_PROVIDER {
+            match openai_codex::codex_status_suffix(effective.store(), &sourced.info.name).await {
+                Some(suffix) => format!("{}; {}", base, suffix),
+                None => base,
+            }
+        } else {
+            base
+        };
+        lines.push(format!(
+            "  {} {}{} [{}; source={}] — {}",
+            marker,
+            sourced.info.name,
+            label,
+            if sourced.info.is_oauth { "oauth" } else { "api-key" },
+            sourced.source.label(),
+            detail,
+        ));
+    }
+    lines
+}
+
+fn parse_import_target(target: &str) -> ImportTarget {
+    match target {
+        "auto" => ImportTarget::Auto,
+        "file" => ImportTarget::File,
+        "seed" => ImportTarget::Seed,
+        "runtime" => ImportTarget::Runtime,
+        other => {
+            eprintln!("Unknown import target '{}'. Use one of: auto, file, seed, runtime", other);
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn run_auth(auth_paths: &AuthStorePaths, action: &AuthAction) {
+    match action {
+        AuthAction::Login {
+            provider,
+            account,
+            code,
+        } => {
+            run_auth_login(auth_paths, provider.as_deref(), account, code.as_deref()).await;
+        }
+        AuthAction::Status { provider, all } => {
+            let effective = auth_paths.load_effective();
+            let store = effective.store();
+            let providers: Vec<String> = if *all || provider.is_none() {
+                store.configured_providers().into_iter().map(ToString::to_string).collect()
+            } else {
+                vec![provider.clone().expect("provider checked above")]
+            };
+
+            if providers.is_empty() {
+                println!("No credentials configured.");
                 println!("\nEnvironment variables:");
-                let providers = [
+                for p in [
                     "anthropic",
                     "openai",
                     "openrouter",
@@ -708,21 +885,57 @@ async fn run_auth(auth_path: &PathBuf, action: &AuthAction) {
                     "perplexity",
                     "cohere",
                     "xai",
-                ];
-                for p in providers {
+                ] {
                     if let Some(var) = env_var_for_provider(p) {
-                        let status = if std::env::var(var).is_ok() {
-                            "✓ set"
-                        } else {
-                            "· not set"
-                        };
+                        let status = if std::env::var(var).is_ok() { "✓ set" } else { "· not set" };
                         println!("  {} {} ({})", status, p, var);
                     }
                 }
             } else {
-                print!("{}", summary);
+                for (idx, provider_name) in providers.iter().enumerate() {
+                    if idx > 0 {
+                        println!();
+                    }
+                    println!("{}:", provider_name);
+                    for line in provider_status_lines(&effective, provider_name).await {
+                        println!("{}", line);
+                    }
+                }
             }
-            println!("\nAuth file: {}", auth_path.display());
+
+            if auth_paths.is_layered() {
+                if let Some(seed) = &auth_paths.seed_file {
+                    println!("\nSeed auth file: {}", seed.display());
+                }
+                if let Some(runtime) = &auth_paths.runtime_file {
+                    println!("Runtime auth file: {}", runtime.display());
+                }
+            } else if let Some(path) = auth_paths.write_path() {
+                println!("\nAuth file: {}", path.display());
+            }
+        }
+        AuthAction::Export { provider, account } => {
+            let effective = auth_paths.load_effective();
+            let Some(record) = effective.export_account(provider, account) else {
+                eprintln!("Account not found: {}/{}", provider, account);
+                std::process::exit(1);
+            };
+            println!("{}", serde_json::to_string_pretty(&record).expect("export should serialize"));
+        }
+        AuthAction::Import { input, target } => {
+            let raw = if input == "-" {
+                let mut buf = String::new();
+                std::io::stdin().read_to_string(&mut buf).expect("failed to read stdin");
+                buf
+            } else {
+                std::fs::read_to_string(input).expect("failed to read import file")
+            };
+            let record: clanker_router::auth::ProviderAccountExport =
+                serde_json::from_str(&raw).expect("failed to parse auth import record");
+            auth_paths
+                .import_account(&record, parse_import_target(target))
+                .expect("failed to import auth record");
+            println!("Imported {}/{} into {} auth store", record.provider, record.account, target);
         }
         AuthAction::SetKey {
             provider,
@@ -744,11 +957,6 @@ async fn run_auth(auth_path: &PathBuf, action: &AuthAction) {
                 std::process::exit(1);
             }
 
-            let mut store = AuthStore::load(auth_path);
-
-            // Auto-detect OAuth access tokens (e.g. from `claude setup-token`).
-            // These need Bearer auth, not x-api-key, so store them as OAuth
-            // credentials with a far-future expiry and no refresh token.
             let credential = if clanker_router::auth::is_oauth_token(&api_key) {
                 let one_year_ms = chrono::Utc::now().timestamp_millis() + 365 * 24 * 3600 * 1000;
                 println!("Detected OAuth access token — storing as OAuth credential");
@@ -765,36 +973,56 @@ async fn run_auth(auth_path: &PathBuf, action: &AuthAction) {
                 }
             };
 
-            store.set_credential(provider, account, credential);
-            store.save(auth_path).expect("failed to save auth store");
-            println!("Saved {} key for account '{}' in {}", provider, account, auth_path.display());
+            auth_paths
+                .mutate_write_store(|store| {
+                    store.set_credential(provider, account, credential.clone());
+                    store.switch_account(provider, account);
+                })
+                .expect("failed to save auth store");
+            println!(
+                "Saved {} key for account '{}' in {}",
+                provider,
+                account,
+                auth_paths.write_path().expect("write path should exist").display()
+            );
         }
         AuthAction::Remove { provider, account } => {
-            let mut store = AuthStore::load(auth_path);
-            if store.remove_account(&provider, &account) {
-                store.save(auth_path).expect("failed to save");
+            let effective = auth_paths.load_effective();
+            let source = effective.source_for(provider, account);
+            if auth_paths.is_layered() && matches!(source, Some(clanker_router::auth::AuthRecordSource::Seed)) {
+                eprintln!("Cannot remove seeded account {}/{} without editing the seed auth store.", provider, account);
+                std::process::exit(1);
+            }
+
+            let mut store = auth_paths.load_write_store();
+            if store.remove_account(provider, account) {
+                auth_paths.save_write_store(&store).expect("failed to save");
                 println!("Removed {}/{}", provider, account);
             } else {
-                eprintln!("Account not found: {}/{}", provider, account);
+                eprintln!("Account not found in writable auth store: {}/{}", provider, account);
                 std::process::exit(1);
             }
         }
         AuthAction::Switch { provider, account } => {
-            let mut store = AuthStore::load(auth_path);
-            if store.switch_account(&provider, &account) {
-                store.save(auth_path).expect("failed to save");
-                println!("Switched {} to account '{}'", provider, account);
-            } else {
+            let effective = auth_paths.load_effective();
+            if effective.store().credential_for(provider, account).is_none() {
                 eprintln!("Account not found: {}/{}", provider, account);
                 std::process::exit(1);
             }
+            auth_paths
+                .mutate_write_store(|store| {
+                    let provider_auth = store.providers.entry(provider.clone()).or_default();
+                    provider_auth.active_account = Some(account.clone());
+                })
+                .expect("failed to save auth store");
+            println!("Switched {} to account '{}'", provider, account);
         }
         AuthAction::Accounts { provider } => {
-            let store = AuthStore::load(auth_path);
-            let providers: Vec<&str> = if let Some(p) = provider {
-                vec![p.as_str()]
+            let effective = auth_paths.load_effective();
+            let providers: Vec<String> = if let Some(provider) = provider {
+                vec![provider.clone()]
             } else {
-                store.configured_providers()
+                effective.store().configured_providers().into_iter().map(ToString::to_string).collect()
             };
 
             if providers.is_empty() {
@@ -802,14 +1030,13 @@ async fn run_auth(auth_path: &PathBuf, action: &AuthAction) {
                 return;
             }
 
-            for p in providers {
-                println!("{}:", p);
-                for info in store.list_accounts(p) {
-                    let marker = if info.is_active { "▸" } else { " " };
-                    let kind = if info.is_oauth { "oauth" } else { "api-key" };
-                    let label = info.label.as_ref().map(|l| format!(" — {}", l)).unwrap_or_default();
-                    let expired = if info.is_expired { " (expired)" } else { "" };
-                    println!("  {} {} [{}]{}{}", marker, info.name, kind, label, expired);
+            for (idx, provider_name) in providers.iter().enumerate() {
+                if idx > 0 {
+                    println!();
+                }
+                println!("{}:", provider_name);
+                for line in provider_status_lines(&effective, provider_name).await {
+                    println!("{}", line);
                 }
             }
         }
@@ -818,26 +1045,31 @@ async fn run_auth(auth_path: &PathBuf, action: &AuthAction) {
 
 // ── OAuth login ─────────────────────────────────────────────────────────
 
-async fn run_auth_login(auth_path: &PathBuf, account: &str, code_input: Option<&str>) {
-    let verifier_path = auth_path.parent().unwrap_or(std::path::Path::new(".")).join(".login_verifier");
+async fn run_auth_login(
+    auth_paths: &AuthStorePaths,
+    provider: Option<&str>,
+    account: &str,
+    code_input: Option<&str>,
+) {
+    let oauth_flow = OAuthFlow::from_provider(provider).expect("provider should be supported");
+    let provider_name = oauth_flow.provider_name();
+    let base_dir = auth_base_dir(auth_paths);
+    let verifier_path = pending_oauth_login_path(&base_dir, provider_name, account);
+    let legacy_path = clanker_router::auth::legacy_pending_oauth_login_path(&base_dir);
 
     let input = if let Some(input) = code_input {
-        // --code was passed directly, recover verifier from disk
         input.to_string()
     } else {
-        // Step 1: generate auth URL and prompt user
-        let (url, verifier) = oauth::build_auth_url();
+        let (url, verifier) = oauth_flow.build_auth_url().expect("oauth url should build");
+        let pending = PendingOAuthLogin::new(provider_name, account.to_string(), verifier);
+        pending.save(&verifier_path).expect("failed to persist pending login");
 
-        println!("Logging in as account: {}", account);
-
-        // Try to open browser
+        println!("Logging in to provider '{}' as account '{}'.", provider_name, account);
         if open::that_detached(&url).is_ok() {
             println!("Opening browser automatically...\n");
         } else {
             println!("Could not open browser automatically.\n");
         }
-
-        // Print clickable hyperlink (OSC 8)
         println!("Ctrl+Click or open this URL in your browser:\n\n  \x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\\n", url, url);
         println!(
             "After authorizing, paste the code or callback URL.\n\
@@ -846,57 +1078,45 @@ async fn run_auth_login(auth_path: &PathBuf, account: &str, code_input: Option<&
              https://...?code=CODE&state=STATE\n"
         );
 
-        // Persist verifier so --code can be used from another invocation
-        if let Some(parent) = verifier_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        std::fs::write(&verifier_path, &verifier).ok();
-
-        // Read input from stdin
         let mut buf = String::new();
         std::io::stdin().read_line(&mut buf).expect("failed to read input");
         buf.trim().to_string()
     };
 
-    // Parse code + state
-    let (code, state) = match parse_oauth_callback(&input) {
-        Ok(pair) => pair,
-        Err(msg) => {
-            eprintln!("Error: {}", msg);
-            std::process::exit(1);
-        }
-    };
+    let (code, state) = parse_oauth_callback(&input).unwrap_or_else(|msg| {
+        eprintln!("Error: {}", msg);
+        std::process::exit(1);
+    });
 
-    // Load verifier
-    let verifier = match std::fs::read_to_string(&verifier_path) {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("Error: No login in progress. Run `clanker-router auth login` first.");
-            std::process::exit(1);
-        }
-    };
+    let pending = PendingOAuthLogin::load(&verifier_path).or_else(|| PendingOAuthLogin::load(&legacy_path)).unwrap_or_else(|| {
+        eprintln!("Error: No login in progress. Run `clanker-router auth login` first.");
+        std::process::exit(1);
+    });
 
-    // Exchange code for credentials
-    let creds = match oauth::exchange_code(&code, &state, &verifier).await {
-        Ok(c) => c,
-        Err(e) => {
+    let creds = oauth_flow
+        .exchange_code(&code, &state, &pending.verifier)
+        .await
+        .unwrap_or_else(|e| {
             eprintln!("Login failed: {}", e);
             std::process::exit(1);
-        }
-    };
+        });
 
-    // Clean up verifier
     std::fs::remove_file(&verifier_path).ok();
+    std::fs::remove_file(&legacy_path).ok();
 
-    // Save to auth store
-    let mut store = AuthStore::load(auth_path);
-    store.set_credential("anthropic", account, creds.to_stored());
-    if store.providers.get("anthropic").and_then(|p| p.active_account.as_deref()).is_none() {
-        store.switch_account("anthropic", account);
-    }
-    store.save(auth_path).expect("failed to save auth store");
+    auth_paths
+        .mutate_write_store(|store| {
+            store.set_credential(provider_name, &pending.account, creds.to_stored());
+            store.switch_account(provider_name, &pending.account);
+        })
+        .expect("failed to save auth store");
 
-    println!("Authentication successful! Saved as account '{}' in {}", account, auth_path.display());
+    println!(
+        "Authentication successful! Saved provider '{}' account '{}' in {}",
+        provider_name,
+        pending.account,
+        auth_paths.write_path().expect("write path should exist").display(),
+    );
 }
 
 /// Parse an OAuth callback input in various formats.
@@ -908,7 +1128,6 @@ async fn run_auth_login(auth_path: &PathBuf, account: &str, code_input: Option<&
 fn parse_oauth_callback(input: &str) -> std::result::Result<(String, String), String> {
     let input = input.trim();
 
-    // URL format
     if input.starts_with("http://") || input.starts_with("https://") {
         if let Ok(url) = url::Url::parse(input) {
             let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
@@ -919,14 +1138,13 @@ fn parse_oauth_callback(input: &str) -> std::result::Result<(String, String), St
         return Err("URL missing 'code' and/or 'state' query parameters.".to_string());
     }
 
-    // code#state format
-    if let Some((code, state)) = input.split_once('#') {
-        if !code.is_empty() && !state.is_empty() {
-            return Ok((code.to_string(), state.to_string()));
-        }
+    if let Some((code, state)) = input.split_once('#')
+        && !code.is_empty()
+        && !state.is_empty()
+    {
+        return Ok((code.to_string(), state.to_string()));
     }
 
-    // space-separated
     if let Some((code, state)) = input.split_once(' ') {
         let code = code.trim();
         let state = state.trim();
@@ -943,8 +1161,8 @@ fn parse_oauth_callback(input: &str) -> std::result::Result<(String, String), St
 
 // ── Resolve ─────────────────────────────────────────────────────────────
 
-fn run_resolve(cli: &Cli, auth_store: &AuthStore, name: &str) {
-    let router = build_router(cli, auth_store);
+async fn run_resolve(cli: &Cli, auth_store: &AuthStore, auth_paths: &AuthStorePaths, name: &str) {
+    let router = build_router(cli, auth_store, auth_paths).await;
 
     // Try alias first
     if let Some(resolved_id) = ModelAliases::resolve(name) {
@@ -970,8 +1188,8 @@ fn run_resolve(cli: &Cli, auth_store: &AuthStore, name: &str) {
 
 // ── Status ──────────────────────────────────────────────────────────────
 
-fn run_status(cli: &Cli, auth_store: &AuthStore) {
-    let router = build_router(cli, auth_store);
+async fn run_status(cli: &Cli, auth_store: &AuthStore, auth_paths: &AuthStorePaths) {
+    let router = build_router(cli, auth_store, auth_paths).await;
 
     println!("clanker-router v{}", env!("CARGO_PKG_VERSION"));
     println!();
@@ -1117,7 +1335,14 @@ fn print_usage_summary(label: &str, usage: &clanker_router::db::usage::DailyUsag
 
 // ── Serve (RPC daemon) ──────────────────────────────────────────────────
 
-async fn run_serve(cli: &Cli, auth_store: &AuthStore, daemon: bool, proxy_addr: &str, proxy_keys: &[String]) {
+async fn run_serve(
+    cli: &Cli,
+    auth_store: &AuthStore,
+    auth_paths: &AuthStorePaths,
+    daemon: bool,
+    proxy_addr: &str,
+    proxy_keys: &[String],
+) {
     use clanker_router::proxy::ProxyConfig;
     use clanker_router::proxy::iroh_tunnel::IrohTunnel;
     use clanker_router::proxy::iroh_tunnel::{self};
@@ -1184,7 +1409,7 @@ async fn run_serve(cli: &Cli, auth_store: &AuthStore, daemon: bool, proxy_addr: 
         return;
     }
 
-    let router = Arc::new(build_router(cli, auth_store));
+    let router = Arc::new(build_router(cli, auth_store, auth_paths).await);
 
     if router.provider_names().is_empty() {
         eprintln!("Error: No providers configured.");
@@ -1199,36 +1424,8 @@ async fn run_serve(cli: &Cli, auth_store: &AuthStore, daemon: bool, proxy_addr: 
     // Start background cache eviction (if DB + cache are enabled)
     let _eviction_handle = router.start_cache_eviction();
 
-    // Start background OAuth token refresh (if Anthropic OAuth is configured)
-    let refresh_cancel = tokio_util::sync::CancellationToken::new();
-    let _refresh_handle = {
-        let has_oauth = auth_store
-            .active_credential("anthropic")
-            .is_some_and(|c| c.is_oauth());
-        if has_oauth {
-            let auth_path = resolve_auth_path(cli);
-            let router_clone = Arc::clone(&router);
-            let update_fn: credential_refresh::CredentialUpdateFn = Arc::new(move |new_token| {
-                let r = Arc::clone(&router_clone);
-                Box::pin(async move {
-                    // Reload all provider credentials — the Anthropic provider
-                    // will pick up the new token from the auth store on next request.
-                    // For immediate effect, we also trigger Provider::reload_credentials.
-                    r.reload_credentials().await;
-                    tracing::debug!("Router credentials reloaded after OAuth refresh");
-                    let _ = new_token; // token already persisted to auth store
-                })
-            });
-            let refresher = credential_refresh::CredentialRefresher::new(
-                auth_path,
-                update_fn,
-                refresh_cancel.clone(),
-            );
-            Some(tokio::spawn(refresher.run()))
-        } else {
-            None
-        }
-    };
+    // OAuth providers refresh on demand during request handling and reload
+    // from the managed auth store when credentials change.
 
     // Parse proxy bind address
     let bind_addr: std::net::SocketAddr = match proxy_addr.parse() {
@@ -1353,7 +1550,6 @@ async fn run_serve(cli: &Cli, auth_store: &AuthStore, daemon: bool, proxy_addr: 
     }
 
     // Graceful shutdown
-    refresh_cancel.cancel();
     iroh_router.shutdown().await.ok();
     DaemonInfo::remove(&info_path);
 }
@@ -1394,7 +1590,7 @@ fn resolve_hf_token(cli: &Cli, auth_store: &AuthStore) -> Option<String> {
     resolve_credential("huggingface", None, auth_store, None).map(|c| c.token().to_string())
 }
 
-async fn run_hf(cli: &Cli, auth_store: &AuthStore, action: &HfAction) {
+async fn run_hf(cli: &Cli, auth_store: &AuthStore, _auth_paths: &AuthStorePaths, action: &HfAction) {
     let token = resolve_hf_token(cli, auth_store);
     let hub = HubClient::new(token);
 
@@ -1617,8 +1813,8 @@ fn format_hf_bytes(bytes: u64) -> String {
 
 // ── TUI ─────────────────────────────────────────────────────────────────
 
-async fn run_tui(cli: &Cli, auth_store: &AuthStore, system: Option<String>) {
-    let router = build_router(cli, auth_store);
+async fn run_tui(cli: &Cli, auth_store: &AuthStore, auth_paths: &AuthStorePaths, system: Option<String>) {
+    let router = build_router(cli, auth_store, auth_paths).await;
 
     if router.provider_names().is_empty() {
         eprintln!("Error: No providers configured.");

@@ -85,6 +85,15 @@ fn test_resolve_provider_fallback() {
     assert_eq!(provider.name(), "anthropic");
 }
 
+#[test]
+fn test_explicit_openai_codex_prefix_fails_closed_when_provider_missing() {
+    let mut router = Router::new("claude-sonnet-4-5-20250514");
+    router.register_provider(make_mock_provider("anthropic", &["claude-sonnet-4-5-20250514"]));
+
+    let result = router.resolve_provider("openai-codex/gpt-5.1-codex");
+    assert!(matches!(result, Err(crate::Error::Auth { .. })));
+}
+
 #[tokio::test]
 async fn test_complete_routes_correctly() {
     let mut router = Router::new("claude-sonnet-4-5-20250514");

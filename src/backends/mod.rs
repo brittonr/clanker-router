@@ -6,4 +6,5 @@
 pub mod anthropic;
 pub mod common;
 pub mod huggingface;
+pub mod openai_codex;
 pub mod openai_compat;

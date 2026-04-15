@@ -1000,10 +1000,20 @@ impl Router {
         }
 
         // 2. Try matching provider name prefix (e.g. "openai/gpt-4o")
-        if let Some((provider_name, _model_id)) = model.split_once('/')
-            && let Some(provider) = self.providers.get(provider_name)
-        {
-            return Ok((provider.as_ref(), None));
+        if let Some((provider_name, _model_id)) = model.split_once('/') {
+            if provider_name == crate::backends::openai_codex::OPENAI_CODEX_PROVIDER
+                && !self.providers.contains_key(provider_name)
+            {
+                return Err(crate::Error::Auth {
+                    message: format!(
+                        "Provider '{}' is not configured or not available for the active account.",
+                        provider_name
+                    ),
+                });
+            }
+            if let Some(provider) = self.providers.get(provider_name) {
+                return Ok((provider.as_ref(), None));
+            }
         }
 
         // 3. Fall back to default model's provider

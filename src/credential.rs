@@ -14,6 +14,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::auth::AuthStore;
+use crate::auth::AuthStorePaths;
 use crate::auth::StoredCredential;
 use crate::error::Result;
 
@@ -30,8 +31,8 @@ pub struct CredentialManager {
     provider: String,
     /// Current credential
     credential: Mutex<StoredCredential>,
-    /// Path to auth.json
-    auth_path: PathBuf,
+    /// Auth store paths (single-file or layered seed/runtime)
+    auth_paths: AuthStorePaths,
     /// Optional fallback auth path
     fallback_auth_path: Option<PathBuf>,
     /// Callback for refreshing OAuth tokens
@@ -52,13 +53,13 @@ impl CredentialManager {
     pub fn new(
         provider: String,
         credential: StoredCredential,
-        auth_path: PathBuf,
+        auth_paths: AuthStorePaths,
         fallback_auth_path: Option<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
             provider,
             credential: Mutex::new(credential),
-            auth_path,
+            auth_paths,
             fallback_auth_path,
             refresh_fn: None,
             refresh_task: Mutex::new(None),
@@ -69,7 +70,7 @@ impl CredentialManager {
     pub fn with_refresh_fn(
         provider: String,
         credential: StoredCredential,
-        auth_path: PathBuf,
+        auth_paths: AuthStorePaths,
         fallback_auth_path: Option<PathBuf>,
         refresh_fn: impl Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<OAuthTokens>> + Send>>
         + Send
@@ -79,7 +80,7 @@ impl CredentialManager {
         Arc::new(Self {
             provider,
             credential: Mutex::new(credential),
-            auth_path,
+            auth_paths,
             fallback_auth_path,
             refresh_fn: Some(Box::new(refresh_fn)),
             refresh_task: Mutex::new(None),
@@ -180,12 +181,12 @@ impl CredentialManager {
 
     /// Perform the refresh with file locking.
     async fn do_refresh(&self, refresh_token: &str) -> Result<StoredCredential> {
-        let auth_path = self.auth_path.clone();
+        let auth_paths = self.auth_paths.clone();
         let provider = self.provider.clone();
         let refresh_token_owned = refresh_token.to_string();
 
         // Check if another instance already refreshed (read from disk)
-        let store = AuthStore::load(&auth_path);
+        let store = auth_paths.load_effective().into_store();
         if let Some(disk_cred) = store.active_credential(&provider)
             && !disk_cred.is_expired()
         {
@@ -221,11 +222,11 @@ impl CredentialManager {
 
     /// Save refreshed credential to disk with file locking
     async fn save_with_lock(&self, credential: &StoredCredential) -> Result<()> {
-        let auth_path = self.auth_path.clone();
+        let auth_paths = self.auth_paths.clone();
         let provider = self.provider.clone();
         let cred = credential.clone();
 
-        tokio::task::spawn_blocking(move || save_with_file_lock(&auth_path, &provider, &cred))
+        tokio::task::spawn_blocking(move || save_with_file_lock(&auth_paths, &provider, &cred))
             .await
             .map_err(|e| crate::Error::Auth {
                 message: format!("Save task panicked: {}", e),
@@ -234,7 +235,7 @@ impl CredentialManager {
 
     /// Reload credentials from disk (e.g. after `/login`).
     pub async fn reload_from_disk(&self) {
-        let store = AuthStore::load(&self.auth_path);
+        let store = self.auth_paths.load_effective().into_store();
         if let Some(cred) = store.active_credential(&self.provider)
             && !cred.is_expired()
         {
@@ -275,16 +276,30 @@ impl CredentialManager {
 }
 
 /// Save credential to disk with exclusive file lock.
-fn save_with_file_lock(auth_path: &std::path::Path, provider: &str, credential: &StoredCredential) -> Result<()> {
+fn save_with_file_lock(auth_paths: &AuthStorePaths, provider: &str, credential: &StoredCredential) -> Result<()> {
     use std::fs;
     use std::io::Write;
 
+    let auth_path = auth_paths.write_path().ok_or_else(|| crate::Error::Auth {
+        message: "no auth store write path configured".to_string(),
+    })?;
+
     if let Some(parent) = auth_path.parent() {
         fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
     }
     if !auth_path.exists() {
         let mut f = fs::File::create(auth_path)?;
         f.write_all(b"{}")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(auth_path, fs::Permissions::from_mode(0o600));
+        }
     }
 
     // Acquire exclusive lock
@@ -311,12 +326,13 @@ fn save_with_file_lock(auth_path: &std::path::Path, provider: &str, credential: 
     };
 
     // Read, update, write
-    let mut store = AuthStore::load(auth_path);
-    let active = store
+    let effective = auth_paths.load_effective().into_store();
+    let active = effective
         .providers
         .get(provider)
         .and_then(|p| p.active_account.clone())
         .unwrap_or_else(|| "default".to_string());
+    let mut store = auth_paths.load_write_store();
     store.set_credential(provider, &active, credential.clone());
     store.save(auth_path)?;
 

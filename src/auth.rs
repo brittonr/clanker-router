@@ -44,9 +44,15 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::path::Path;
+use std::path::PathBuf;
 
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rand::RngCore;
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 
 /// Top-level auth store (serialized to auth.json)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -82,7 +88,7 @@ pub struct ProviderAuth {
 }
 
 /// A stored credential (API key or OAuth)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "credential_type")]
 pub enum StoredCredential {
     /// Static API key
@@ -360,6 +366,234 @@ pub struct AccountInfo {
     pub is_oauth: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthRecordSource {
+    File,
+    Seed,
+    Runtime,
+}
+
+impl AuthRecordSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Seed => "seed",
+            Self::Runtime => "runtime",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SourcedAccountInfo {
+    pub info: AccountInfo,
+    pub source: AuthRecordSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderAccountExport {
+    #[serde(default = "default_export_version")]
+    pub version: u32,
+    pub provider: String,
+    pub account: String,
+    #[serde(default)]
+    pub active: bool,
+    pub credential: StoredCredential,
+}
+
+fn default_export_version() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportTarget {
+    Auto,
+    File,
+    Seed,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthStorePaths {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed_file: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EffectiveAuthStore {
+    store: AuthStore,
+    sources: HashMap<String, HashMap<String, AuthRecordSource>>,
+}
+
+impl EffectiveAuthStore {
+    pub fn store(&self) -> &AuthStore {
+        &self.store
+    }
+
+    pub fn into_store(self) -> AuthStore {
+        self.store
+    }
+
+    pub fn source_for(&self, provider: &str, account: &str) -> Option<AuthRecordSource> {
+        self.sources.get(provider).and_then(|accounts| accounts.get(account)).copied()
+    }
+
+    pub fn list_accounts_with_sources(&self, provider: &str) -> Vec<SourcedAccountInfo> {
+        self.store
+            .list_accounts(provider)
+            .into_iter()
+            .map(|info| SourcedAccountInfo {
+                source: self.source_for(provider, &info.name).unwrap_or(AuthRecordSource::File),
+                info,
+            })
+            .collect()
+    }
+
+    pub fn export_account(&self, provider: &str, account: &str) -> Option<ProviderAccountExport> {
+        let credential = self.store.credential_for(provider, account)?.clone();
+        Some(ProviderAccountExport {
+            version: default_export_version(),
+            provider: provider.to_string(),
+            account: account.to_string(),
+            active: self.store.active_credential(provider).is_some()
+                && self.store.providers.get(provider).and_then(|p| p.active_account.as_deref()) == Some(account),
+            credential,
+        })
+    }
+}
+
+impl AuthStorePaths {
+    pub fn single(path: PathBuf) -> Self {
+        Self {
+            auth_file: Some(path),
+            seed_file: None,
+            runtime_file: None,
+        }
+    }
+
+    pub fn layered(seed_file: PathBuf, runtime_file: PathBuf) -> Self {
+        Self {
+            auth_file: None,
+            seed_file: Some(seed_file),
+            runtime_file: Some(runtime_file),
+        }
+    }
+
+    pub fn is_layered(&self) -> bool {
+        self.seed_file.is_some() || self.runtime_file.is_some()
+    }
+
+    pub fn write_source(&self) -> AuthRecordSource {
+        if self.runtime_file.is_some() {
+            AuthRecordSource::Runtime
+        } else if self.seed_file.is_some() {
+            AuthRecordSource::Seed
+        } else {
+            AuthRecordSource::File
+        }
+    }
+
+    pub fn write_path(&self) -> Option<&Path> {
+        self.runtime_file
+            .as_deref()
+            .or(self.auth_file.as_deref())
+            .or(self.seed_file.as_deref())
+    }
+
+    pub fn pending_oauth_base_dir(&self) -> Option<PathBuf> {
+        self.write_path()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+    }
+
+    pub fn load_effective(&self) -> EffectiveAuthStore {
+        if !self.is_layered() {
+            let store = self.auth_file.as_deref().map(AuthStore::load).unwrap_or_default();
+            let mut sources = HashMap::new();
+            for provider in store.configured_providers() {
+                let per_provider = store
+                    .list_accounts(provider)
+                    .into_iter()
+                    .map(|info| (info.name, AuthRecordSource::File))
+                    .collect();
+                sources.insert(provider.to_string(), per_provider);
+            }
+            return EffectiveAuthStore { store, sources };
+        }
+
+        let seed_store = self.seed_file.as_deref().map(AuthStore::load).unwrap_or_default();
+        let runtime_store = self.runtime_file.as_deref().map(AuthStore::load).unwrap_or_default();
+
+        let mut merged = seed_store.clone();
+        merged.version = merged.version.max(runtime_store.version);
+
+        let mut sources: HashMap<String, HashMap<String, AuthRecordSource>> = HashMap::new();
+        for (provider, auth) in &seed_store.providers {
+            let per_provider = sources.entry(provider.clone()).or_default();
+            for account in auth.accounts.keys() {
+                per_provider.insert(account.clone(), AuthRecordSource::Seed);
+            }
+        }
+
+        for (provider, auth) in &runtime_store.providers {
+            let merged_provider = merged.providers.entry(provider.clone()).or_default();
+            if let Some(active_account) = &auth.active_account {
+                merged_provider.active_account = Some(active_account.clone());
+            }
+            let per_provider = sources.entry(provider.clone()).or_default();
+            for (account, credential) in &auth.accounts {
+                merged_provider.accounts.insert(account.clone(), credential.clone());
+                per_provider.insert(account.clone(), AuthRecordSource::Runtime);
+            }
+        }
+
+        EffectiveAuthStore { store: merged, sources }
+    }
+
+    pub fn load_write_store(&self) -> AuthStore {
+        self.write_path().map(AuthStore::load).unwrap_or_default()
+    }
+
+    pub fn save_write_store(&self, store: &AuthStore) -> crate::Result<()> {
+        let path = self.write_path().ok_or_else(|| crate::Error::Auth {
+            message: "no auth store write path configured".to_string(),
+        })?;
+        store.save(path)
+    }
+
+    pub fn mutate_write_store<F>(&self, mutate: F) -> crate::Result<()>
+    where
+        F: FnOnce(&mut AuthStore),
+    {
+        let mut store = self.load_write_store();
+        mutate(&mut store);
+        self.save_write_store(&store)
+    }
+
+    pub fn import_account(&self, export: &ProviderAccountExport, target: ImportTarget) -> crate::Result<()> {
+        let path = match target {
+            ImportTarget::Auto => self.write_path(),
+            ImportTarget::File => self.auth_file.as_deref().or(self.write_path()),
+            ImportTarget::Seed => self.seed_file.as_deref(),
+            ImportTarget::Runtime => self.runtime_file.as_deref(),
+        }
+        .ok_or_else(|| crate::Error::Auth {
+            message: format!("no {:?} auth store configured", target),
+        })?;
+
+        let mut store = AuthStore::load(path);
+        store.set_credential(&export.provider, &export.account, export.credential.clone());
+        if export.active || store.active_credential(&export.provider).is_none() {
+            store.switch_account(&export.provider, &export.account);
+        }
+        store.save(path)
+    }
+}
+
 // ── Env var resolution ──────────────────────────────────────────────────
 
 /// Well-known environment variables for provider API keys
@@ -451,6 +685,290 @@ pub fn resolve_credential(
 /// Check if a token looks like an Anthropic OAuth token
 pub fn is_oauth_token(token: &str) -> bool {
     token.contains("sk-ant-oat")
+}
+
+const OPENAI_CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_CODEX_REDIRECT_URI: &str = "http://localhost:1455/auth/callback";
+const OPENAI_CODEX_SCOPE: &str = "openid profile email offline_access";
+const OPENAI_CODEX_ACCOUNT_CLAIM: &str = "https://api.openai.com/auth";
+const OPENAI_CODEX_ACCOUNT_ID_KEY: &str = "chatgpt_account_id";
+
+#[derive(Debug)]
+struct PkceChallenge {
+    verifier: String,
+    challenge: String,
+}
+
+fn generate_pkce() -> PkceChallenge {
+    let mut verifier_bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut verifier_bytes);
+
+    let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
+
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
+
+    PkceChallenge { verifier, challenge }
+}
+
+fn expiration_from_expires_in(expires_in: i64) -> i64 {
+    chrono::Utc::now().timestamp_millis() + (expires_in * 1000) - (5 * 60 * 1000)
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiCodexTokenResponse {
+    access_token: String,
+    refresh_token: String,
+    expires_in: i64,
+}
+
+pub fn openai_codex_account_id_from_access_token(access_token: &str) -> crate::Result<String> {
+    let mut parts = access_token.split('.');
+    let _header = parts.next();
+    let payload = parts.next().ok_or_else(|| crate::Error::Auth {
+        message: "OpenAI Codex access token missing JWT payload".to_string(),
+    })?;
+    let _signature = parts.next().ok_or_else(|| crate::Error::Auth {
+        message: "OpenAI Codex access token missing JWT signature".to_string(),
+    })?;
+    if parts.next().is_some() {
+        return Err(crate::Error::Auth {
+            message: "OpenAI Codex access token has too many JWT segments".to_string(),
+        });
+    }
+
+    let payload_bytes = URL_SAFE_NO_PAD.decode(payload).map_err(|e| crate::Error::Auth {
+        message: format!("Failed to decode OpenAI Codex JWT payload: {e}"),
+    })?;
+    let payload_json: serde_json::Value = serde_json::from_slice(&payload_bytes).map_err(|e| crate::Error::Auth {
+        message: format!("Failed to parse OpenAI Codex JWT payload: {e}"),
+    })?;
+
+    payload_json
+        .get(OPENAI_CODEX_ACCOUNT_CLAIM)
+        .and_then(|value| value.get(OPENAI_CODEX_ACCOUNT_ID_KEY))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| crate::Error::Auth {
+            message: "OpenAI Codex access token missing https://api.openai.com/auth.chatgpt_account_id".to_string(),
+        })
+}
+
+pub fn openai_codex_account_id_from_credential(credential: &StoredCredential) -> crate::Result<String> {
+    openai_codex_account_id_from_access_token(credential.token())
+}
+
+fn validate_openai_codex_tokens(tokens: &OpenAiCodexTokenResponse) -> crate::Result<()> {
+    openai_codex_account_id_from_access_token(&tokens.access_token).map(|_| ())
+}
+
+fn openai_codex_code_exchange_form(code: &str, verifier: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("grant_type", "authorization_code".to_string()),
+        ("client_id", OPENAI_CODEX_CLIENT_ID.to_string()),
+        ("code", code.to_string()),
+        ("code_verifier", verifier.to_string()),
+        ("redirect_uri", OPENAI_CODEX_REDIRECT_URI.to_string()),
+    ]
+}
+
+fn openai_codex_refresh_form(refresh_token: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("grant_type", "refresh_token".to_string()),
+        ("client_id", OPENAI_CODEX_CLIENT_ID.to_string()),
+        ("refresh_token", refresh_token.to_string()),
+    ]
+}
+
+fn build_openai_codex_auth_url() -> crate::Result<(String, String)> {
+    let pkce = generate_pkce();
+    let url = url::Url::parse_with_params(
+        OPENAI_CODEX_AUTHORIZE_URL,
+        &[
+            ("response_type", "code"),
+            ("client_id", OPENAI_CODEX_CLIENT_ID),
+            ("redirect_uri", OPENAI_CODEX_REDIRECT_URI),
+            ("scope", OPENAI_CODEX_SCOPE),
+            ("code_challenge", pkce.challenge.as_str()),
+            ("code_challenge_method", "S256"),
+            ("state", pkce.verifier.as_str()),
+            ("id_token_add_organizations", "true"),
+            ("codex_cli_simplified_flow", "true"),
+            ("originator", "pi"),
+        ],
+    )
+    .map_err(|e| crate::Error::Auth {
+        message: format!("invalid OpenAI Codex authorization URL: {e}"),
+    })?;
+    Ok((url.to_string(), pkce.verifier))
+}
+
+async fn exchange_openai_codex_code(code: &str, verifier: &str) -> crate::Result<crate::oauth::OAuthCredentials> {
+    let response = reqwest::Client::new()
+        .post(OPENAI_CODEX_TOKEN_URL)
+        .form(&openai_codex_code_exchange_form(code, verifier))
+        .send()
+        .await
+        .map_err(|e| crate::Error::Auth {
+            message: format!("failed to send OpenAI Codex token exchange request: {e}"),
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_else(|_| "unknown error".to_string());
+        return Err(crate::Error::Auth {
+            message: format!("OpenAI Codex token exchange failed ({status}): {error_text}"),
+        });
+    }
+
+    let tokens: OpenAiCodexTokenResponse = response.json().await.map_err(|e| crate::Error::Auth {
+        message: format!("failed to parse OpenAI Codex token exchange response: {e}"),
+    })?;
+    validate_openai_codex_tokens(&tokens)?;
+
+    Ok(crate::oauth::OAuthCredentials {
+        access: tokens.access_token,
+        refresh: tokens.refresh_token,
+        expires: expiration_from_expires_in(tokens.expires_in),
+    })
+}
+
+async fn refresh_openai_codex_token(refresh_token: &str) -> crate::Result<crate::oauth::OAuthCredentials> {
+    let response = reqwest::Client::new()
+        .post(OPENAI_CODEX_TOKEN_URL)
+        .form(&openai_codex_refresh_form(refresh_token))
+        .send()
+        .await
+        .map_err(|e| crate::Error::Auth {
+            message: format!("failed to send OpenAI Codex token refresh request: {e}"),
+        })?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_else(|_| "unknown error".to_string());
+        return Err(crate::Error::Auth {
+            message: format!("OpenAI Codex token refresh failed ({status}): {error_text}"),
+        });
+    }
+
+    let tokens: OpenAiCodexTokenResponse = response.json().await.map_err(|e| crate::Error::Auth {
+        message: format!("failed to parse OpenAI Codex token refresh response: {e}"),
+    })?;
+    validate_openai_codex_tokens(&tokens)?;
+
+    Ok(crate::oauth::OAuthCredentials {
+        access: tokens.access_token,
+        refresh: tokens.refresh_token,
+        expires: expiration_from_expires_in(tokens.expires_in),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthFlow {
+    Anthropic,
+    OpenAiCodex,
+}
+
+impl OAuthFlow {
+    pub fn provider_name(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAiCodex => "openai-codex",
+        }
+    }
+
+    pub fn from_provider(provider: Option<&str>) -> crate::Result<Self> {
+        match provider.unwrap_or("anthropic") {
+            "anthropic" => Ok(Self::Anthropic),
+            "openai-codex" => Ok(Self::OpenAiCodex),
+            other => Err(crate::Error::Auth {
+                message: format!(
+                    "OAuth login is not supported for provider '{other}'. Supported OAuth providers: anthropic, openai-codex"
+                ),
+            }),
+        }
+    }
+
+    pub fn build_auth_url(self) -> crate::Result<(String, String)> {
+        match self {
+            Self::Anthropic => Ok(crate::oauth::build_auth_url()),
+            Self::OpenAiCodex => build_openai_codex_auth_url(),
+        }
+    }
+
+    pub async fn exchange_code(
+        self,
+        code: &str,
+        state: &str,
+        verifier: &str,
+    ) -> crate::Result<crate::oauth::OAuthCredentials> {
+        match self {
+            Self::Anthropic => crate::oauth::exchange_code(code, state, verifier).await,
+            Self::OpenAiCodex => {
+                let _ = state;
+                exchange_openai_codex_code(code, verifier).await
+            }
+        }
+    }
+
+    pub async fn refresh_token(self, refresh_token: &str) -> crate::Result<crate::oauth::OAuthCredentials> {
+        match self {
+            Self::Anthropic => crate::oauth::refresh_token(refresh_token).await,
+            Self::OpenAiCodex => refresh_openai_codex_token(refresh_token).await,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingOAuthLogin {
+    pub provider: String,
+    pub account: String,
+    pub verifier: String,
+}
+
+pub fn legacy_pending_oauth_login_path(base_dir: &Path) -> PathBuf {
+    base_dir.join(".login_verifier")
+}
+
+pub fn pending_oauth_login_path(base_dir: &Path, provider: &str, account: &str) -> PathBuf {
+    let provider_component: String = url::form_urlencoded::byte_serialize(provider.as_bytes()).collect();
+    let account_component: String = url::form_urlencoded::byte_serialize(account.as_bytes()).collect();
+    base_dir.join(".login_verifiers").join(provider_component).join(format!("{account_component}.json"))
+}
+
+impl PendingOAuthLogin {
+    pub fn new(provider: impl Into<String>, account: impl Into<String>, verifier: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            account: account.into(),
+            verifier: verifier.into(),
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    pub fn load(path: &Path) -> Option<Self> {
+        let raw = std::fs::read_to_string(path).ok()?;
+        serde_json::from_str(&raw).ok().or_else(|| {
+            let verifier = raw.trim();
+            if verifier.is_empty() {
+                None
+            } else {
+                Some(Self::new("anthropic", "default", verifier.to_string()))
+            }
+        })
+    }
 }
 
 #[cfg(test)]
