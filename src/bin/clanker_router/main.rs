@@ -644,6 +644,27 @@ async fn main() {
 
 // ── Ask (non-interactive) ───────────────────────────────────────────────
 
+fn requests_openai_codex_explicitly(cli: &Cli) -> bool {
+    cli.provider.as_deref() == Some(openai_codex::OPENAI_CODEX_PROVIDER)
+        || cli.model.trim().starts_with("openai-codex/")
+}
+
+fn exit_no_providers(cli: &Cli) -> ! {
+    if requests_openai_codex_explicitly(cli) {
+        eprintln!(
+            "Error: openai-codex is unavailable because no valid openai-codex credential is active."
+        );
+        eprintln!("Import or log in to an openai-codex account first:");
+        eprintln!("  clanker-router auth import --input record.json --target file");
+        eprintln!("  clanker-router auth login --provider openai-codex");
+    } else {
+        eprintln!("Error: No providers configured. Set an API key:");
+        eprintln!("  clanker-router auth set-key openai sk-...");
+        eprintln!("  export OPENAI_API_KEY=sk-...");
+    }
+    std::process::exit(1);
+}
+
 async fn run_ask(
     cli: &Cli,
     auth_store: &AuthStore,
@@ -657,10 +678,7 @@ async fn run_ask(
     let router = build_router(cli, auth_store, auth_paths).await;
 
     if router.provider_names().is_empty() {
-        eprintln!("Error: No providers configured. Set an API key:");
-        eprintln!("  clanker-router auth set-key openai sk-...");
-        eprintln!("  export OPENAI_API_KEY=sk-...");
-        std::process::exit(1);
+        exit_no_providers(cli);
     }
 
     let request = CompletionRequest {
@@ -1845,11 +1863,7 @@ async fn run_tui(cli: &Cli, auth_store: &AuthStore, auth_paths: &AuthStorePaths,
     let router = build_router(cli, auth_store, auth_paths).await;
 
     if router.provider_names().is_empty() {
-        eprintln!("Error: No providers configured.");
-        eprintln!("Set an API key first:");
-        eprintln!("  clanker-router auth set-key openai sk-...");
-        eprintln!("  export OPENAI_API_KEY=sk-...");
-        std::process::exit(1);
+        exit_no_providers(cli);
     }
 
     let model_names: Vec<String> = router.list_models().iter().map(|m| m.id.clone()).collect();
